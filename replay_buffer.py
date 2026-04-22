@@ -8,18 +8,29 @@ import pickle
 
 
 class ReplayBuffer():
-    def __init__(self, obs_shape, num_envs, max_length=int(1E6), warmup_length=50000, store_on_gpu=False) -> None:
+    def __init__(self, obs_shape, num_envs, max_length=int(1E6), warmup_length=50000, store_on_gpu=False,
+                 action_dim=None, proprio_dim=0) -> None:
         self.store_on_gpu = store_on_gpu
+        # action shape: None/0/1 = scalar (Atari), >1 = vector (continuous).
+        self.action_is_vector = action_dim is not None and action_dim > 1
+        self.action_dim = action_dim if self.action_is_vector else 1
+        self.proprio_dim = proprio_dim
+        self.use_proprio = proprio_dim > 0
+        action_shape = (self.action_dim,) if self.action_is_vector else ()
         if store_on_gpu:
             self.obs_buffer = torch.empty((max_length//num_envs, num_envs, *obs_shape), dtype=torch.uint8, device="cuda", requires_grad=False)
-            self.action_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
+            self.action_buffer = torch.empty((max_length//num_envs, num_envs, *action_shape), dtype=torch.float32, device="cuda", requires_grad=False)
             self.reward_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
             self.termination_buffer = torch.empty((max_length//num_envs, num_envs), dtype=torch.float32, device="cuda", requires_grad=False)
+            if self.use_proprio:
+                self.proprio_buffer = torch.empty((max_length//num_envs, num_envs, proprio_dim), dtype=torch.float32, device="cuda", requires_grad=False)
         else:
             self.obs_buffer = np.empty((max_length//num_envs, num_envs, *obs_shape), dtype=np.uint8)
-            self.action_buffer = np.empty((max_length//num_envs, num_envs), dtype=np.float32)
+            self.action_buffer = np.empty((max_length//num_envs, num_envs, *action_shape), dtype=np.float32)
             self.reward_buffer = np.empty((max_length//num_envs, num_envs), dtype=np.float32)
             self.termination_buffer = np.empty((max_length//num_envs, num_envs), dtype=np.float32)
+            if self.use_proprio:
+                self.proprio_buffer = np.empty((max_length//num_envs, num_envs, proprio_dim), dtype=np.float32)
 
         self.length = 0
         self.num_envs = num_envs
@@ -56,7 +67,7 @@ class ReplayBuffer():
     @torch.no_grad()
     def sample(self, batch_size, external_batch_size, batch_length, to_device="cuda"):
         if self.store_on_gpu:
-            obs, action, reward, termination = [], [], [], []
+            obs, action, reward, termination, proprio = [], [], [], [], []
             if batch_size > 0:
                 for i in range(self.num_envs):
                     indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs)
@@ -64,6 +75,8 @@ class ReplayBuffer():
                     action.append(torch.stack([self.action_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     reward.append(torch.stack([self.reward_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     termination.append(torch.stack([self.termination_buffer[idx:idx+batch_length, i] for idx in indexes]))
+                    if self.use_proprio:
+                        proprio.append(torch.stack([self.proprio_buffer[idx:idx+batch_length, i] for idx in indexes]))
 
             if self.external_buffer_length is not None and external_batch_size > 0:
                 external_obs, external_action, external_reward, external_termination = self.sample_external(
@@ -78,8 +91,10 @@ class ReplayBuffer():
             action = torch.cat(action, dim=0)
             reward = torch.cat(reward, dim=0)
             termination = torch.cat(termination, dim=0)
+            if self.use_proprio:
+                proprio = torch.cat(proprio, dim=0)
         else:
-            obs, action, reward, termination = [], [], [], []
+            obs, action, reward, termination, proprio = [], [], [], [], []
             if batch_size > 0:
                 for i in range(self.num_envs):
                     indexes = np.random.randint(0, self.length+1-batch_length, size=batch_size//self.num_envs)
@@ -87,6 +102,8 @@ class ReplayBuffer():
                     action.append(np.stack([self.action_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     reward.append(np.stack([self.reward_buffer[idx:idx+batch_length, i] for idx in indexes]))
                     termination.append(np.stack([self.termination_buffer[idx:idx+batch_length, i] for idx in indexes]))
+                    if self.use_proprio:
+                        proprio.append(np.stack([self.proprio_buffer[idx:idx+batch_length, i] for idx in indexes]))
 
             if self.external_buffer_length is not None and external_batch_size > 0:
                 external_obs, external_action, external_reward, external_termination = self.sample_external(
@@ -101,23 +118,33 @@ class ReplayBuffer():
             action = torch.from_numpy(np.concatenate(action, axis=0)).cuda()
             reward = torch.from_numpy(np.concatenate(reward, axis=0)).cuda()
             termination = torch.from_numpy(np.concatenate(termination, axis=0)).cuda()
+            if self.use_proprio:
+                proprio = torch.from_numpy(np.concatenate(proprio, axis=0)).cuda()
 
+        if self.use_proprio:
+            return obs, action, reward, termination, proprio
         return obs, action, reward, termination
 
-    def append(self, obs, action, reward, termination):
-        # obs/nex_obs: torch Tensor
-        # action/reward/termination: int or float or bool
+    def append(self, obs, action, reward, termination, proprio=None):
+        # obs: (N, H, W, C) uint8
+        # action: (N,) int, or (N, A) float for continuous
+        # reward/termination: (N,) float/bool
+        # proprio (optional): (N, D) float
         self.last_pointer = (self.last_pointer + 1) % (self.max_length//self.num_envs)
         if self.store_on_gpu:
             self.obs_buffer[self.last_pointer] = torch.from_numpy(obs)
-            self.action_buffer[self.last_pointer] = torch.from_numpy(action)
-            self.reward_buffer[self.last_pointer] = torch.from_numpy(reward)
-            self.termination_buffer[self.last_pointer] = torch.from_numpy(termination)
+            self.action_buffer[self.last_pointer] = torch.from_numpy(np.asarray(action, dtype=np.float32))
+            self.reward_buffer[self.last_pointer] = torch.from_numpy(np.asarray(reward, dtype=np.float32))
+            self.termination_buffer[self.last_pointer] = torch.from_numpy(np.asarray(termination, dtype=np.float32))
+            if self.use_proprio and proprio is not None:
+                self.proprio_buffer[self.last_pointer] = torch.from_numpy(np.asarray(proprio, dtype=np.float32))
         else:
             self.obs_buffer[self.last_pointer] = obs
             self.action_buffer[self.last_pointer] = action
             self.reward_buffer[self.last_pointer] = reward
             self.termination_buffer[self.last_pointer] = termination
+            if self.use_proprio and proprio is not None:
+                self.proprio_buffer[self.last_pointer] = proprio
 
         if len(self) < self.max_length:
             self.length += 1

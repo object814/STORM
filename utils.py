@@ -18,8 +18,8 @@ def seed_np_torch(seed=20010105):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # some cudnn methods can be random even after fixing the seed unless you tell it to be deterministic
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    # torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 
 
 class Logger():
@@ -101,6 +101,20 @@ def load_config(config_path):
     conf.JointTrainAgent.TrainAgentEverySteps = 0
     conf.JointTrainAgent.SaveEverySteps = 0
     conf.JointTrainAgent.UseDemonstration = False
+
+    # ------ Metaworld-specific fields (optional, ignored for Atari) ------
+    conf.Env = CN()
+    conf.Env.Suite = "atari"  # "atari" or "metaworld"
+    conf.Env.TaskName = ""
+    conf.Env.TimeLimit = 500
+    conf.Env.CameraNames = ["topview", "front", "gripperPOV"]
+    conf.Env.RewardMin = -1.0
+    conf.Env.RewardMax = 0.0
+
+    conf.Models.WorldModel.ContinuousAction = False
+    conf.Models.WorldModel.ProprioDim = 0
+    conf.Models.WorldModel.ProprioHiddenDim = 256
+    conf.Models.WorldModel.ProprioEmbedDim = 256
 
     conf.defrost()
     conf.merge_from_file(config_path)

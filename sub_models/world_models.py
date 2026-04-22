@@ -13,7 +13,7 @@ import agents
 
 
 class EncoderBN(nn.Module):
-    def __init__(self, in_channels, stem_channels, final_feature_width) -> None:
+    def __init__(self, in_channels, stem_channels, final_feature_width, input_size=64) -> None:
         super().__init__()
 
         backbone = []
@@ -28,7 +28,10 @@ class EncoderBN(nn.Module):
                 bias=False
             )
         )
-        feature_width = 64//2
+        # Each stride-2 conv halves the spatial resolution. We start after
+        # the stem (//2) and keep halving until we hit `final_feature_width`.
+        # Supporting arbitrary `input_size` lets us train at 128x128 etc.
+        feature_width = input_size // 2
         channels = stem_channels
         backbone.append(nn.BatchNorm2d(stem_channels))
         backbone.append(nn.ReLU(inplace=True))
@@ -129,7 +132,7 @@ class DistHead(nn.Module):
         # uniform noise mixing
         probs = F.softmax(logits, dim=-1)
         mixed_probs = mixing_ratio * torch.ones_like(probs) / self.stoch_dim + (1-mixing_ratio) * probs
-        logits = torch.log(mixed_probs)
+        logits = torch.log(mixed_probs.clamp_min(1e-8))
         return logits
 
     def forward_post(self, x):
@@ -213,9 +216,46 @@ class CategoricalKLDivLossWithFreeBits(nn.Module):
         return kl_div, real_kl_div
 
 
+class ProprioEncoder(nn.Module):
+    """Small MLP that embeds a proprio vector into a flat feature."""
+    def __init__(self, proprio_dim, hidden_dim, out_dim, num_layers=2):
+        super().__init__()
+        layers = [nn.Linear(proprio_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(inplace=True)]
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(inplace=True)]
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x: (B, L, D)
+        B, L = x.shape[:2]
+        x = x.reshape(B * L, -1)
+        x = self.net(x)
+        return x.reshape(B, L, -1)
+
+
+class ProprioDecoder(nn.Module):
+    """MLP head that reconstructs proprio from the stochastic latent."""
+    def __init__(self, stoch_dim, hidden_dim, proprio_dim, num_layers=2):
+        super().__init__()
+        layers = [nn.Linear(stoch_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(inplace=True)]
+        for _ in range(num_layers - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.ReLU(inplace=True)]
+        layers.append(nn.Linear(hidden_dim, proprio_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, sample):
+        B, L = sample.shape[:2]
+        x = sample.reshape(B * L, -1)
+        x = self.net(x)
+        return x.reshape(B, L, -1)
+
+
 class WorldModel(nn.Module):
     def __init__(self, in_channels, action_dim,
-                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads):
+                 transformer_max_length, transformer_hidden_dim, transformer_num_layers, transformer_num_heads,
+                 continuous_action=False, proprio_dim=0, proprio_hidden_dim=256, proprio_embed_dim=256,
+                 input_size=64):
         super().__init__()
         self.transformer_hidden_dim = transformer_hidden_dim
         self.final_feature_width = 4
@@ -225,12 +265,29 @@ class WorldModel(nn.Module):
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
+        self.continuous_action = continuous_action
+        self.action_dim = action_dim
+        self.proprio_dim = proprio_dim
+        self.use_proprio = proprio_dim > 0
+        self.input_size = input_size
 
         self.encoder = EncoderBN(
             in_channels=in_channels,
             stem_channels=32,
-            final_feature_width=self.final_feature_width
+            final_feature_width=self.final_feature_width,
+            input_size=input_size,
         )
+        image_feat_dim = self.encoder.last_channels*self.final_feature_width*self.final_feature_width
+        if self.use_proprio:
+            self.proprio_encoder = ProprioEncoder(
+                proprio_dim=proprio_dim, hidden_dim=proprio_hidden_dim, out_dim=proprio_embed_dim
+            )
+            combined_feat_dim = image_feat_dim + proprio_embed_dim
+            self.proprio_decoder = ProprioDecoder(
+                stoch_dim=self.stoch_flattened_dim, hidden_dim=proprio_hidden_dim, proprio_dim=proprio_dim
+            )
+        else:
+            combined_feat_dim = image_feat_dim
         self.storm_transformer = StochasticTransformerKVCache(
             stoch_dim=self.stoch_flattened_dim,
             action_dim=action_dim,
@@ -238,10 +295,11 @@ class WorldModel(nn.Module):
             num_layers=transformer_num_layers,
             num_heads=transformer_num_heads,
             max_length=transformer_max_length,
-            dropout=0.1
+            dropout=0.1,
+            continuous_action=continuous_action,
         )
         self.dist_head = DistHead(
-            image_feat_dim=self.encoder.last_channels*self.final_feature_width*self.final_feature_width,
+            image_feat_dim=combined_feat_dim,
             transformer_hidden_dim=transformer_hidden_dim,
             stoch_dim=self.stoch_dim
         )
@@ -270,9 +328,18 @@ class WorldModel(nn.Module):
         self.optimizer = torch.optim.Adam(self.parameters(), lr=1e-4)
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-    def encode_obs(self, obs):
+    def _encode_combined(self, obs, proprio=None):
+        """Encode image (and optional proprio) into the combined flat embedding
+        fed to the post distribution head."""
+        image_embedding = self.encoder(obs)
+        if self.use_proprio and proprio is not None:
+            proprio_embedding = self.proprio_encoder(proprio)
+            return torch.cat([image_embedding, proprio_embedding], dim=-1)
+        return image_embedding
+
+    def encode_obs(self, obs, proprio=None):
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            embedding = self.encoder(obs)
+            embedding = self._encode_combined(obs, proprio)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             flattened_sample = self.flatten_sample(sample)
@@ -332,20 +399,25 @@ class WorldModel(nn.Module):
             latent_size = (imagine_batch_size, imagine_batch_length+1, self.stoch_flattened_dim)
             hidden_size = (imagine_batch_size, imagine_batch_length+1, self.transformer_hidden_dim)
             scalar_size = (imagine_batch_size, imagine_batch_length)
+            if self.continuous_action:
+                action_buffer_size = (imagine_batch_size, imagine_batch_length, self.action_dim)
+            else:
+                action_buffer_size = scalar_size
             self.latent_buffer = torch.zeros(latent_size, dtype=dtype, device="cuda")
             self.hidden_buffer = torch.zeros(hidden_size, dtype=dtype, device="cuda")
-            self.action_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
+            self.action_buffer = torch.zeros(action_buffer_size, dtype=dtype, device="cuda")
             self.reward_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
             self.termination_hat_buffer = torch.zeros(scalar_size, dtype=dtype, device="cuda")
 
     def imagine_data(self, agent: agents.ActorCriticAgent, sample_obs, sample_action,
-                     imagine_batch_size, imagine_batch_length, log_video, logger):
+                     imagine_batch_size, imagine_batch_length, log_video, logger,
+                     sample_proprio=None):
         self.init_imagine_buffer(imagine_batch_size, imagine_batch_length, dtype=self.tensor_dtype)
         obs_hat_list = []
 
         self.storm_transformer.reset_kv_cache_list(imagine_batch_size, dtype=self.tensor_dtype)
-        # context
-        context_latent = self.encode_obs(sample_obs)
+        # context (uses real obs+proprio for the initial posterior)
+        context_latent = self.encode_obs(sample_obs, sample_proprio)
         for i in range(sample_obs.shape[1]):  # context_length is sample_obs.shape[1]
             last_obs_hat, last_reward_hat, last_termination_hat, last_latent, last_dist_feat = self.predict_next(
                 context_latent[:, i:i+1],
@@ -375,19 +447,21 @@ class WorldModel(nn.Module):
 
         return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
 
-    def update(self, obs, action, reward, termination, logger=None):
+    def update(self, obs, action, reward, termination, logger=None, proprio=None):
         self.train()
         batch_size, batch_length = obs.shape[:2]
 
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            # encoding
-            embedding = self.encoder(obs)
+            # encoding (image + optional proprio)
+            embedding = self._encode_combined(obs, proprio)
             post_logits = self.dist_head.forward_post(embedding)
             sample = self.stright_throught_gradient(post_logits, sample_mode="random_sample")
             flattened_sample = self.flatten_sample(sample)
 
             # decoding image
             obs_hat = self.image_decoder(flattened_sample)
+            if self.use_proprio:
+                proprio_hat = self.proprio_decoder(flattened_sample)
 
             # transformer
             temporal_mask = get_subsequent_mask_with_batch_length(batch_length, flattened_sample.device)
@@ -399,23 +473,44 @@ class WorldModel(nn.Module):
 
             # env loss
             reconstruction_loss = self.mse_loss_func(obs_hat, obs)
+            if self.use_proprio:
+                proprio_recon_loss = ((proprio_hat - proprio) ** 2).sum(dim=-1).mean()
+            else:
+                proprio_recon_loss = torch.tensor(0.0, device=obs.device)
             reward_loss = self.symlog_twohot_loss_func(reward_hat, reward)
             termination_loss = self.bce_with_logits_loss_func(termination_hat, termination)
             # dyn-rep loss
             dynamics_loss, dynamics_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:].detach(), prior_logits[:, :-1])
             representation_loss, representation_real_kl_div = self.categorical_kl_div_loss(post_logits[:, 1:], prior_logits[:, :-1].detach())
-            total_loss = reconstruction_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+            total_loss = reconstruction_loss + proprio_recon_loss + reward_loss + termination_loss + 0.5*dynamics_loss + 0.1*representation_loss
+
+        if not torch.isfinite(total_loss):
+            stats = {
+                "recon": reconstruction_loss.item(), "reward": reward_loss.item(),
+                "term": termination_loss.item(), "dyn": dynamics_loss.item(),
+                "rep": representation_loss.item(),
+                "post_logits_absmax": post_logits.abs().max().item(),
+                "prior_logits_absmax": prior_logits.abs().max().item(),
+                "obs_min_max": (obs.min().item(), obs.max().item()),
+                "reward_min_max": (reward.min().item(), reward.max().item()),
+            }
+            raise RuntimeError(f"Non-finite world-model loss: {stats}")
 
         # gradient descent
         self.scaler.scale(total_loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1000.0)
-        self.scaler.step(self.optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=100.0)
+        if torch.isfinite(grad_norm):
+            self.scaler.step(self.optimizer)
+        elif logger is not None:
+            logger.log("WorldModel/skipped_step", 1.0)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
 
         if logger is not None:
             logger.log("WorldModel/reconstruction_loss", reconstruction_loss.item())
+            if self.use_proprio:
+                logger.log("WorldModel/proprio_recon_loss", proprio_recon_loss.item())
             logger.log("WorldModel/reward_loss", reward_loss.item())
             logger.log("WorldModel/termination_loss", termination_loss.item())
             logger.log("WorldModel/dynamics_loss", dynamics_loss.item())
@@ -423,3 +518,5 @@ class WorldModel(nn.Module):
             logger.log("WorldModel/representation_loss", representation_loss.item())
             logger.log("WorldModel/representation_real_kl_div", representation_real_kl_div.item())
             logger.log("WorldModel/total_loss", total_loss.item())
+            logger.log("WorldModel/grad_norm", grad_norm.item())
+            logger.log("WorldModel/reward_batch_absmax", reward.abs().max().item())

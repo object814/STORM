@@ -35,11 +35,13 @@ def calc_lambda_return(rewards, values, termination, gamma, lam, dtype=torch.flo
 
 
 class ActorCriticAgent(nn.Module):
-    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef) -> None:
+    def __init__(self, feat_dim, num_layers, hidden_dim, action_dim, gamma, lambd, entropy_coef, continuous_action=False) -> None:
         super().__init__()
         self.gamma = gamma
         self.lambd = lambd
         self.entropy_coef = entropy_coef
+        self.continuous_action = continuous_action
+        self.action_dim = action_dim
         self.use_amp = True
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
 
@@ -56,10 +58,15 @@ class ActorCriticAgent(nn.Module):
                 nn.LayerNorm(hidden_dim),
                 nn.ReLU()
             ])
+        # For continuous actions, the head outputs mean and std.
+        actor_out_dim = 2 * action_dim if continuous_action else action_dim
         self.actor = nn.Sequential(
             *actor,
-            nn.Linear(hidden_dim, action_dim)
+            nn.Linear(hidden_dim, actor_out_dim)
         )
+        # Bounds for the squashed normal std (matches dreamer "normal" dist).
+        self._min_std = 0.1
+        self._max_std = 1.0
 
         critic = [
             nn.Linear(feat_dim, hidden_dim, bias=False),
@@ -90,6 +97,22 @@ class ActorCriticAgent(nn.Module):
         for slow_param, param in zip(self.slow_critic.parameters(), self.critic.parameters()):
             slow_param.data.copy_(slow_param.data * decay + param.data * (1 - decay))
 
+    def _build_action_dist(self, raw):
+        """Return a torch distribution over actions.
+
+        Discrete: Categorical over logits.
+        Continuous: tanh-squashed diagonal Normal with bounded std
+                    (mean is tanh'd). Matches the "normal" variant in
+                    dreamer's MLP head.
+        """
+        if not self.continuous_action:
+            return distributions.Categorical(logits=raw)
+        mean, std = torch.chunk(raw, 2, dim=-1)
+        mean = torch.tanh(mean)
+        std = (self._max_std - self._min_std) * torch.sigmoid(std + 2.0) + self._min_std
+        base = distributions.Normal(mean, std)
+        return distributions.Independent(base, 1)
+
     def policy(self, x):
         logits = self.actor(x)
         return logits
@@ -114,16 +137,26 @@ class ActorCriticAgent(nn.Module):
     def sample(self, latent, greedy=False):
         self.eval()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
-            logits = self.policy(latent)
-            dist = distributions.Categorical(logits=logits)
-            if greedy:
-                action = dist.probs.argmax(dim=-1)
+            raw = self.policy(latent)
+            dist = self._build_action_dist(raw)
+            if self.continuous_action:
+                if greedy:
+                    action = torch.tanh(torch.chunk(raw, 2, dim=-1)[0])
+                else:
+                    action = dist.sample()
+                action = action.clamp(-1.0, 1.0)
             else:
-                action = dist.sample()
+                if greedy:
+                    action = dist.probs.argmax(dim=-1)
+                else:
+                    action = dist.sample()
         return action
 
     def sample_as_env_action(self, latent, greedy=False):
         action = self.sample(latent, greedy)
+        if self.continuous_action:
+            # (B, 1, A) -> (B, A) numpy
+            return action.detach().cpu().squeeze(1).float().numpy()
         return action.detach().cpu().squeeze(-1).numpy()
 
     def update(self, latent, action, old_logprob, old_value, reward, termination, logger=None):
@@ -133,8 +166,11 @@ class ActorCriticAgent(nn.Module):
         self.train()
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
             logits, raw_value = self.get_logits_raw_value(latent)
-            dist = distributions.Categorical(logits=logits[:, :-1])
-            log_prob = dist.log_prob(action)
+            dist = self._build_action_dist(logits[:, :-1])
+            if self.continuous_action:
+                log_prob = dist.log_prob(action.clamp(-0.999, 0.999))
+            else:
+                log_prob = dist.log_prob(action)
             entropy = dist.entropy()
 
             # decode value, calc lambda return
@@ -158,11 +194,24 @@ class ActorCriticAgent(nn.Module):
 
             loss = policy_loss + value_loss + slow_value_regularization_loss - self.entropy_coef * entropy_loss
 
+        if not torch.isfinite(loss):
+            stats = {
+                "policy": policy_loss.item(), "value": value_loss.item(),
+                "entropy": entropy_loss.item(),
+                "logits_absmax": logits.abs().max().item(),
+                "reward_min_max": (reward.min().item(), reward.max().item()),
+                "lambda_return_absmax": lambda_return.abs().max().item(),
+            }
+            raise RuntimeError(f"Non-finite actor-critic loss: {stats}")
+
         # gradient descent
         self.scaler.scale(loss).backward()
         self.scaler.unscale_(self.optimizer)  # for clip grad
-        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=100.0)
-        self.scaler.step(self.optimizer)
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=10.0)
+        if torch.isfinite(grad_norm):
+            self.scaler.step(self.optimizer)
+        elif logger is not None:
+            logger.log('ActorCritic/skipped_step', 1.0)
         self.scaler.update()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -175,3 +224,4 @@ class ActorCriticAgent(nn.Module):
             logger.log('ActorCritic/S', S.item())
             logger.log('ActorCritic/norm_ratio', norm_ratio.item())
             logger.log('ActorCritic/total_loss', loss.item())
+            logger.log('ActorCritic/grad_norm', grad_norm.item())
