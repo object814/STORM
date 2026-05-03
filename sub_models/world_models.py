@@ -261,7 +261,15 @@ class WorldModel(nn.Module):
         self.final_feature_width = 4
         self.stoch_dim = 32
         self.stoch_flattened_dim = self.stoch_dim*self.stoch_dim
-        self.use_amp = True
+        # DEBUG: AMP disabled to test the BN+bf16 overflow hypothesis. BN
+        # backward in train mode involves 1/var^(3/2); with task-1-tuned
+        # encoder applied to task-2 images, low-variance channels can
+        # produce Inf in bf16 but stay finite in fp32. If sequential
+        # learning works with use_amp=False, the architectural fix is to
+        # replace BatchNorm with LayerNorm (matching dreamer). Restore to
+        # True after the experiment.
+        self.use_amp = False
+        # DEBUG: end AMP-disable
         self.tensor_dtype = torch.bfloat16 if self.use_amp else torch.float32
         self.imagine_batch_size = -1
         self.imagine_batch_length = -1
@@ -319,6 +327,16 @@ class WorldModel(nn.Module):
             embedding_size=self.stoch_flattened_dim,
             transformer_hidden_dim=transformer_hidden_dim
         )
+        # Zero-init head output layers. Matches dreamerv3's outscale=0 for
+        # reward / continuation heads (configs.yaml; see uniform_weight_init
+        # with given_scale=0 → limit=0 → all weights 0). Fresh heads then
+        # predict exactly 0 on the first forward pass, so initial reward /
+        # termination losses are tiny and don't shock the rest of the model
+        # via backprop on the first few batches.
+        torch.nn.init.zeros_(self.reward_decoder.head.weight)
+        torch.nn.init.zeros_(self.reward_decoder.head.bias)
+        torch.nn.init.zeros_(self.termination_decoder.head[0].weight)
+        torch.nn.init.zeros_(self.termination_decoder.head[0].bias)
 
         self.mse_loss_func = MSELoss()
         self.ce_loss = nn.CrossEntropyLoss()
