@@ -1,6 +1,8 @@
 import numpy as np
+import os
 import random
 import unittest
+import uuid
 import torch
 from einops import rearrange
 import copy
@@ -60,6 +62,166 @@ class ReplayBuffer():
             reward = np.stack([self.external_buffer["reward"][idx:idx+batch_length] for idx in indexes])
             termination = np.stack([self.external_buffer["done"][idx:idx+batch_length] for idx in indexes])
         return obs, action, reward, termination
+
+    def save_episode(self, directory, episode):
+        """Write one completed episode to ``directory/{uuid}-{len}.npz``.
+
+        ``episode`` is a dict of 1D/ND numpy arrays with keys ``obs``,
+        ``action``, ``reward``, ``termination`` and optionally ``proprio``.
+        Uses an atomic ``.tmp`` → rename so a kill mid-write cannot leave a
+        truncated file that breaks the next ``load_from_directory`` call.
+        """
+        assert self.num_envs == 1, "save_episode currently assumes NumEnvs=1"
+        os.makedirs(directory, exist_ok=True)
+        length = int(episode["reward"].shape[0])
+        ep_id = uuid.uuid4().hex
+        filename = f"{ep_id}-{length}.npz"
+        final_path = os.path.join(directory, filename)
+        tmp_path = final_path + ".tmp"
+        np.savez_compressed(tmp_path, **episode)
+        # np.savez appends ".npz" if the path does not already end in it.
+        tmp_with_ext = tmp_path if tmp_path.endswith(".npz") else tmp_path + ".npz"
+        os.replace(tmp_with_ext, final_path)
+        return final_path
+
+    def load_from_directory(self, directory):
+        """Reload episodes from ``directory`` back into the ring buffer.
+
+        Reads newest-first (reverse sorted by filename), appending transitions
+        back into the ring until ``self.max_length`` would be exceeded. Returns
+        a dict with:
+          - ``transitions_restored``: int — total transitions appended
+          - ``episodes_restored``: int — number of .npz files consumed
+          - ``kept_ids``: set[str] — stems of files kept (for pruning)
+        Files older than the ring-buffer cap are listed in the result but not
+        deleted here; the caller decides via ``erase_over_episode_files``.
+        """
+        assert self.num_envs == 1, "load_from_directory currently assumes NumEnvs=1"
+        if not os.path.isdir(directory):
+            return {"transitions_restored": 0, "episodes_restored": 0, "kept_ids": set()}
+
+        # Sorted ascending so we replay episodes in chronological order; the
+        # ring buffer's last_pointer will end up at the most-recent transition.
+        files = sorted(f for f in os.listdir(directory) if f.endswith(".npz"))
+        if not files:
+            return {"transitions_restored": 0, "episodes_restored": 0, "kept_ids": set()}
+
+        cap = self.max_length // self.num_envs
+        # Pick the suffix that fits: keep newest until cap is reached.
+        lengths = []
+        for fname in files:
+            try:
+                stem = os.path.splitext(fname)[0]
+                length = int(stem.rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                length = 0
+            lengths.append(length)
+
+        # Walk from newest backwards, collect files until we hit cap.
+        kept = []
+        total = 0
+        for fname, length in reversed(list(zip(files, lengths))):
+            if total + length > cap and kept:
+                break
+            kept.append(fname)
+            total += length
+        kept.reverse()  # chronological again
+
+        transitions_restored = 0
+        episodes_restored = 0
+        for fname in kept:
+            path = os.path.join(directory, fname)
+            try:
+                with np.load(path) as ep:
+                    obs = ep["obs"]
+                    action = ep["action"]
+                    reward = ep["reward"]
+                    termination = ep["termination"]
+                    proprio = ep["proprio"] if "proprio" in ep.files else None
+            except (OSError, ValueError, EOFError) as e:
+                print(f"[ReplayBuffer] skipping corrupt episode {fname}: {e}")
+                continue
+
+            n = reward.shape[0]
+            for t in range(n):
+                step_obs = obs[t:t + 1]  # (1, H, W, C)
+                step_action = action[t:t + 1]
+                step_reward = reward[t:t + 1]
+                step_term = termination[t:t + 1]
+                step_proprio = proprio[t:t + 1] if proprio is not None else None
+                self.append(step_obs, step_action, step_reward, step_term,
+                            proprio=step_proprio)
+            transitions_restored += n
+            episodes_restored += 1
+
+        kept_ids = {os.path.splitext(f)[0] for f in kept}
+        return {
+            "transitions_restored": transitions_restored,
+            "episodes_restored": episodes_restored,
+            "kept_ids": kept_ids,
+        }
+
+    @staticmethod
+    def erase_over_episode_files(directory, kept_ids):
+        """Delete any ``.npz`` in ``directory`` whose stem is not in ``kept_ids``."""
+        if not os.path.isdir(directory):
+            return 0
+        removed = 0
+        for fname in os.listdir(directory):
+            if not fname.endswith(".npz"):
+                continue
+            if os.path.splitext(fname)[0] in kept_ids:
+                continue
+            try:
+                os.remove(os.path.join(directory, fname))
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
+    @staticmethod
+    def prune_episode_dir_to_cap(directory, max_total_steps):
+        """FIFO-prune old ``.npz`` files so the directory holds at most
+        ``max_total_steps`` transitions across all remaining episodes.
+
+        Filenames must follow the ``{id}-{length}.npz`` convention; files that
+        don't parse are left alone. Deletes oldest-first (sorted ascending by
+        filename, which for uuid4 hex prefixes is effectively random but
+        stable — sufficient for FIFO at our granularity).
+        """
+        if not os.path.isdir(directory) or max_total_steps <= 0:
+            return 0
+        entries = []
+        for fname in os.listdir(directory):
+            if not fname.endswith(".npz"):
+                continue
+            path = os.path.join(directory, fname)
+            try:
+                stem = os.path.splitext(fname)[0]
+                length = int(stem.rsplit("-", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            entries.append((mtime, fname, length, path))
+
+        # Oldest first by mtime so FIFO is actually first-in-first-out.
+        entries.sort(key=lambda e: e[0])
+        total = sum(e[2] for e in entries)
+        removed = 0
+        idx = 0
+        while total > max_total_steps and idx < len(entries):
+            _, _, length, path = entries[idx]
+            try:
+                os.remove(path)
+                total -= length
+                removed += 1
+            except OSError:
+                pass
+            idx += 1
+        return removed
 
     def ready(self):
         return self.length * self.num_envs > self.warmup_length
