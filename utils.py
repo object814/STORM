@@ -67,6 +67,7 @@ def load_config(config_path):
     conf.BasicSettings.Seed = 0
     conf.BasicSettings.ImageSize = 0
     conf.BasicSettings.ReplayBufferOnGPU = False
+    conf.BasicSettings.SaveEpisodesToDisk = True
 
     # Under this setting, input 128*128 -> latent 16*16*64
     conf.Models = CN()
