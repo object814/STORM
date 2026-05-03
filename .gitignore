@@ -1,3 +1,5 @@
 ckpt/
 runs/
 training/
+logdir/
+sweep/
