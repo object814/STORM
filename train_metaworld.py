@@ -17,7 +17,9 @@ Example:
         -wandb_project Metaworld_STORM_Single
 """
 import argparse
+import json
 import os
+import re
 import shutil
 import warnings
 from collections import deque
@@ -68,6 +70,63 @@ class WandbTBLogger:
                 wandb.log({}, commit=True, step=step) if step is not None else wandb.log({}, commit=True)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+#  Resume / checkpoint helpers
+# ---------------------------------------------------------------------------
+_CKPT_STEP_RE = re.compile(r"world_model_(\d+)\.pth$")
+
+
+def _latest_ckpt_step(ckpt_dir):
+    """Return the largest ``<step>`` for which both world_model and agent
+    checkpoints exist under ``ckpt_dir``, or ``None`` if none found."""
+    if not os.path.isdir(ckpt_dir):
+        return None
+    steps = []
+    for fname in os.listdir(ckpt_dir):
+        m = _CKPT_STEP_RE.match(fname)
+        if not m:
+            continue
+        step = int(m.group(1))
+        if os.path.exists(os.path.join(ckpt_dir, f"agent_{step}.pth")):
+            steps.append(step)
+    return max(steps) if steps else None
+
+
+def _prune_old_ckpts(ckpt_dir, keep_last=2):
+    """Keep only the ``keep_last`` most-recent world_model/agent pairs."""
+    if not os.path.isdir(ckpt_dir):
+        return
+    steps = []
+    for fname in os.listdir(ckpt_dir):
+        m = _CKPT_STEP_RE.match(fname)
+        if m:
+            steps.append(int(m.group(1)))
+    steps = sorted(set(steps))
+    for step in steps[:-keep_last]:
+        for name in (f"world_model_{step}.pth", f"agent_{step}.pth"):
+            path = os.path.join(ckpt_dir, name)
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _save_manifest(path, manifest):
+    """Atomically write ``manifest`` (a JSON-serializable dict) to ``path``."""
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(manifest, f)
+    os.replace(tmp, path)
+
+
+def _load_manifest(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -145,8 +204,23 @@ def world_model_imagine_data(replay_buffer, world_model, agent,
 # ---------------------------------------------------------------------------
 def joint_train_world_model_agent(
     env_name, conf, replay_buffer, world_model, agent, logger, run_name,
+    start_iter=0, episodes_done_init=0,
+    episode_dir=None, save_episodes=True,
+    wandb_run_id=None,
+    ckpt_dir=None, manifest_path=None,
 ):
-    os.makedirs(f"ckpt/{run_name}", exist_ok=True)
+    # Backward compat: derive paths from run_name when caller doesn't pass them.
+    if ckpt_dir is None:
+        ckpt_dir = Path("ckpt") / run_name
+    else:
+        ckpt_dir = Path(ckpt_dir)
+    if manifest_path is None:
+        manifest_path = Path("runs") / run_name / "manifest.json"
+    else:
+        manifest_path = Path(manifest_path)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if save_episodes and episode_dir is not None:
+        os.makedirs(episode_dir, exist_ok=True)
 
     num_envs = conf.JointTrainAgent.NumEnvs
     max_steps = conf.JointTrainAgent.SampleMaxSteps
@@ -176,7 +250,7 @@ def joint_train_world_model_agent(
 
     sum_reward = np.zeros(num_envs)
     episode_steps = np.zeros(num_envs, dtype=np.int64)
-    episodes_done = 0
+    episodes_done = episodes_done_init
 
     current_obs, current_info = vec_env.reset()
     current_proprio = np.asarray(current_info["proprio"], dtype=np.float32)
@@ -185,10 +259,18 @@ def joint_train_world_model_agent(
     context_action = deque(maxlen=16)
     context_proprio = deque(maxlen=16)
 
-    total_iters = max_steps // num_envs
-    pbar = tqdm(total=total_iters, desc=">>> STORM training", unit="step")
+    # Per-env running episode accumulator for on-disk persistence.
+    # Keys match ReplayBuffer.save_episode's expected schema.
+    current_episode = [
+        {"obs": [], "action": [], "reward": [], "termination": [], "proprio": []}
+        for _ in range(num_envs)
+    ]
 
-    for total_steps in range(total_iters):
+    total_iters = max_steps // num_envs
+    pbar = tqdm(total=total_iters, initial=start_iter,
+                desc=">>> STORM training", unit="step")
+
+    for total_steps in range(start_iter, total_iters):
         # -------- act --------
         if replay_buffer.ready():
             world_model.eval()
@@ -235,6 +317,18 @@ def joint_train_world_model_agent(
             proprio=current_proprio if replay_buffer.use_proprio else None,
         )
 
+        # Mirror the append into each env's episode accumulator so we can
+        # flush the full episode to disk on `done` / `truncated`. Slice per-env
+        # to match ReplayBuffer's (N, ...) conventions.
+        if save_episodes and episode_dir is not None:
+            for i in range(num_envs):
+                current_episode[i]["obs"].append(current_obs[i])
+                current_episode[i]["action"].append(action[i])
+                current_episode[i]["reward"].append(np.float32(reward[i]))
+                current_episode[i]["termination"].append(np.float32(term_signal[i]))
+                if replay_buffer.use_proprio:
+                    current_episode[i]["proprio"].append(current_proprio[i])
+
         sum_reward += reward
         episode_steps += 1
         done_flag = np.logical_or(done, truncated)
@@ -247,6 +341,24 @@ def joint_train_world_model_agent(
                     episodes_done += 1
                     sum_reward[i] = 0
                     episode_steps[i] = 0
+
+                    if save_episodes and episode_dir is not None and current_episode[i]["reward"]:
+                        ep = {
+                            "obs": np.stack(current_episode[i]["obs"], axis=0),
+                            "action": np.stack(current_episode[i]["action"], axis=0),
+                            "reward": np.asarray(current_episode[i]["reward"], dtype=np.float32),
+                            "termination": np.asarray(current_episode[i]["termination"], dtype=np.float32),
+                        }
+                        if replay_buffer.use_proprio:
+                            ep["proprio"] = np.stack(current_episode[i]["proprio"], axis=0)
+                        try:
+                            replay_buffer.save_episode(episode_dir, ep)
+                        except Exception as e:
+                            print(f"[train_metaworld] save_episode failed: {e}")
+                        current_episode[i] = {
+                            "obs": [], "action": [], "reward": [],
+                            "termination": [], "proprio": [],
+                        }
             # Reset context on episode boundary.
             context_obs.clear()
             context_action.clear()
@@ -293,10 +405,30 @@ def joint_train_world_model_agent(
 
         # -------- checkpointing --------
         if total_steps % (max(save_every // num_envs, 1)) == 0:
-            ckpt_dir = Path("ckpt") / run_name
-            ckpt_dir.mkdir(parents=True, exist_ok=True)
             torch.save(world_model.state_dict(), ckpt_dir / f"world_model_{total_steps}.pth")
             torch.save(agent.state_dict(), ckpt_dir / f"agent_{total_steps}.pth")
+
+            # Resume manifest sits alongside TB logs in run_dir.
+            manifest = {
+                "iter": int(total_steps),
+                "env_step": int(total_steps * num_envs),
+                "episodes_done": int(episodes_done),
+                "wandb_run_id": wandb_run_id,
+            }
+            _save_manifest(manifest_path, manifest)
+
+            # Bound disk: keep only the 2 most-recent (world_model, agent) pairs.
+            _prune_old_ckpts(str(ckpt_dir), keep_last=2)
+
+            # FIFO-prune on-disk episodes so total transitions stay ≤ BufferMaxLength.
+            # Matches the in-memory ring-buffer cap, so disk footprint tracks RAM.
+            if save_episodes and episode_dir is not None:
+                removed = replay_buffer.prune_episode_dir_to_cap(
+                    episode_dir, conf.JointTrainAgent.BufferMaxLength,
+                )
+                if removed:
+                    print(f"[train_metaworld] pruned {removed} old episode files "
+                          f"(cap={conf.JointTrainAgent.BufferMaxLength})")
 
         # -------- progress bar --------
         if total_steps % 20 == 0:
@@ -332,6 +464,16 @@ if __name__ == "__main__":
     parser.add_argument("-wandb_entity", type=str, default=None)
     parser.add_argument("-wandb_project", type=str, default="Metaworld_STORM_Single")
     parser.add_argument("-wandb_run_name", type=str, default=None)
+    parser.add_argument("-wandb_run_id", type=str, default=None,
+                        help="Pin the wandb run id (used by sweep launchers for deterministic resume).")
+    parser.add_argument("-wandb_group", type=str, default=None,
+                        help="WandB group; multiple seeds of one taskset share a group.")
+    parser.add_argument("-wandb_tags", nargs="*", default=None,
+                        help="WandB tags (space-separated).")
+    parser.add_argument("-logdir", type=str, default=None,
+                        help="If set, write runs/ + ckpt/ directly under this directory "
+                             "instead of the cwd-relative runs/<n> and ckpt/<n>. The sweep "
+                             "harness uses this to give each run its own folder.")
     parser.add_argument("-no_wandb", action="store_true")
     args, opts = parser.parse_known_args()
 
@@ -348,14 +490,44 @@ if __name__ == "__main__":
 
     seed_np_torch(seed=args.seed)
 
-    run_dir = Path("runs") / args.n
+    if args.logdir:
+        # Sweep mode: collapse runs/ckpt under one user-specified folder.
+        logdir_root = Path(args.logdir)
+        run_dir = logdir_root / "runs"
+        ckpt_dir = logdir_root / "ckpt"
+    else:
+        # Backward compat with hand-launched training/*.sh scripts.
+        run_dir = Path("runs") / args.n
+        ckpt_dir = Path("ckpt") / args.n
     run_dir.mkdir(parents=True, exist_ok=True)
     tb_logger = Logger(path=str(run_dir))
     shutil.copy(args.config_path, run_dir / "config.yaml")
 
+    # -------- auto-resume discovery --------
+    # A resume is possible iff BOTH a model checkpoint AND a manifest exist.
+    # (Either alone is evidence of a partial/corrupt state we don't trust.)
+    manifest_path = run_dir / "manifest.json"
+    episode_dir = run_dir / "train_eps"
+    resume_step = _latest_ckpt_step(str(ckpt_dir))
+    resume_manifest = _load_manifest(manifest_path)
+    is_resume = resume_step is not None and resume_manifest is not None
+    prior_wandb_run_id = resume_manifest.get("wandb_run_id") if resume_manifest else None
+    if is_resume:
+        print(colorama.Fore.GREEN
+              + f">>> AUTO-RESUME: found ckpt step {resume_step} and manifest "
+                f"(env_step={resume_manifest.get('env_step')}, "
+                f"episodes={resume_manifest.get('episodes_done')}, "
+                f"wandb_id={prior_wandb_run_id})"
+              + colorama.Style.RESET_ALL)
+    else:
+        print(colorama.Fore.YELLOW
+              + f">>> AUTO-RESUME: starting fresh (ckpt_step={resume_step}, "
+                f"manifest={'yes' if resume_manifest else 'no'})"
+              + colorama.Style.RESET_ALL)
+
     use_wandb = (not args.no_wandb) and wandb is not None
     if use_wandb:
-        wandb.init(
+        wandb_kwargs = dict(
             entity=args.wandb_entity,
             project=args.wandb_project,
             name=args.wandb_run_name or args.n,
@@ -367,14 +539,37 @@ if __name__ == "__main__":
             ),
             dir=str(run_dir),
         )
+        # CLI -wandb_run_id wins over the manifest's prior id; lets the sweep
+        # launcher pin a deterministic id from the run_name hash. Falls back to
+        # the manifest for hand-launched scripts that don't pass an id.
+        pinned_id = args.wandb_run_id or (prior_wandb_run_id if is_resume else None)
+        if pinned_id:
+            wandb_kwargs["id"] = pinned_id
+        # `allow` covers both first launch (creates a new run with our id) and
+        # resume (re-attaches to it). `must` would reject the first-launch case.
+        wandb_kwargs["resume"] = "allow"
+        if args.wandb_group:
+            wandb_kwargs["group"] = args.wandb_group
+        if args.wandb_tags:
+            wandb_kwargs["tags"] = list(args.wandb_tags)
+        wandb.init(**wandb_kwargs)
+        active_wandb_run_id = wandb.run.id if wandb.run is not None else None
     elif wandb is None and not args.no_wandb:
         print(colorama.Fore.YELLOW
               + "wandb not installed, continuing with TB-only logging"
               + colorama.Style.RESET_ALL)
+        active_wandb_run_id = None
+    else:
+        active_wandb_run_id = None
     logger = WandbTBLogger(tb_logger, use_wandb=use_wandb)
 
     if conf.Task != "JointTrainAgent":
         raise NotImplementedError(f"Task {conf.Task} not implemented")
+
+    assert conf.JointTrainAgent.NumEnvs == 1, (
+        "Auto-resume currently assumes NumEnvs=1 "
+        f"(got {conf.JointTrainAgent.NumEnvs})"
+    )
 
     # Construct a dummy env to discover action / proprio dims.
     dummy_env = mw_env.build_single_metaworld_env(
@@ -418,6 +613,43 @@ if __name__ == "__main__":
         proprio_dim=proprio_dim,
     )
 
+    # -------- apply resume (if any) --------
+    save_episodes = bool(getattr(conf.BasicSettings, "SaveEpisodesToDisk", True))
+    start_iter = 0
+    episodes_done_init = 0
+    if is_resume:
+        wm_ckpt = ckpt_dir / f"world_model_{resume_step}.pth"
+        ag_ckpt = ckpt_dir / f"agent_{resume_step}.pth"
+        print(colorama.Fore.GREEN
+              + f">>> Loading model weights: {wm_ckpt.name}, {ag_ckpt.name}"
+              + colorama.Style.RESET_ALL)
+        world_model.load_state_dict(torch.load(wm_ckpt, map_location="cuda"))
+        agent.load_state_dict(torch.load(ag_ckpt, map_location="cuda"))
+        start_iter = int(resume_manifest.get("iter", resume_step))
+        episodes_done_init = int(resume_manifest.get("episodes_done", 0))
+
+        # Reload episodes into the ring buffer. Buffer is auto-bounded by
+        # its own capacity (keeps newest-first until full).
+        if save_episodes:
+            stats = replay_buffer.load_from_directory(str(episode_dir))
+            print(colorama.Fore.GREEN
+                  + f">>> Reloaded {stats['transitions_restored']} transitions "
+                    f"from {stats['episodes_restored']} episodes "
+                    f"(buffer length: {len(replay_buffer)})"
+                  + colorama.Style.RESET_ALL)
+            # Prune any episode files on disk that didn't make it back into
+            # the (bounded) in-memory ring.
+            if stats["kept_ids"]:
+                removed = ReplayBuffer.erase_over_episode_files(
+                    str(episode_dir), stats["kept_ids"])
+                if removed:
+                    print(f">>> Pruned {removed} stale episode files")
+        else:
+            print(colorama.Fore.YELLOW
+                  + ">>> SaveEpisodesToDisk=False: buffer starts EMPTY on resume "
+                    "(model weights still restored)"
+                  + colorama.Style.RESET_ALL)
+
     try:
         joint_train_world_model_agent(
             env_name=args.env_name,
@@ -427,6 +659,13 @@ if __name__ == "__main__":
             agent=agent,
             logger=logger,
             run_name=args.n,
+            start_iter=start_iter,
+            episodes_done_init=episodes_done_init,
+            episode_dir=str(episode_dir),
+            save_episodes=save_episodes,
+            wandb_run_id=active_wandb_run_id,
+            ckpt_dir=str(ckpt_dir),
+            manifest_path=str(manifest_path),
         )
         exit_code = 0
     except BaseException as e:
