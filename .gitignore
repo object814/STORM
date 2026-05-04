@@ -3,3 +3,5 @@ runs/
 training/
 logdir/
 sweep/
+
+*_training/
