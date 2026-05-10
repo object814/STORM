@@ -1,53 +1,58 @@
-"""Sequential STORM training with cross-task evaluation on Meta-World.
+"""Sequential STORM training with PackNet (conservative / paper-faithful)
+and cross-task evaluation.
 
-Mirrors ``third_party/dreamerv3/dreamer_sequential.py`` but for STORM.
-Trains a sequence of tasks, keeping the SHARED world-model core (encoder,
-image decoder, proprio encoder/decoder, STORM transformer, dist_head)
-across tasks while REINITIALISING the reward decoder, termination
-decoder, and actor-critic per task. Replay buffer is fresh each task.
+Mirrors ``third_party/dreamerv3/packnet_training/dreamer_sequential_packnet.py``
+but for STORM, building on ``third_party/STORM/train_metaworld_sequential.py``.
 
-Continual-learning protocol:
-  1. Task 1: init everything fresh, train, evaluate, save three split
-     checkpoints (rssm.pt, task_heads.pt, actor_critic.pt).
-  2. Task N > 1: load previous task's rssm.pt into the existing
-     WorldModel, reinit reward_decoder + termination_decoder, rebuild
-     actor-critic from scratch, fresh replay buffer, train. At every
-     eval interval evaluate on task N AND every previous task (by
-     temporarily swapping in that task's saved task_heads + agent).
+Continual-learning protocol (per task N):
+  1. Init/reset reward + termination decoders + actor-critic; keep the
+     shared world-model core (encoder, transformer, dist_head, image
+     decoder, proprio_*) with calibrated Adam moments.
+  2. Train for ``task_steps[N]`` env steps, with per-step gradient masking
+     so PREVIOUSLY FROZEN shared-core weights and post-task-1 shared
+     (1D) params receive zero gradient.
+  3. Prune this task's free shared-core weight matrices by magnitude.
+  4. Retrain for ``packnet_retrain_ratio × task_steps[N]`` env steps with
+     pruned weights re-zeroed every step (Adam momentum + weight decay
+     can otherwise revive them).
+  5. Freeze the surviving weights into the cumulative ``frozen_mask`` and
+     store the task-specific evaluation mask.
+  6. Save split checkpoints + ``packnet_state_task{N}.pt`` for resume.
 
-Split-checkpoint layout per task:
-    <logdir>/task{N}_<name>/
-        rssm.pt           — shared core (no reward/termination)
-        task_heads.pt      — reward_decoder + termination_decoder
-        actor_critic.pt    — ActorCriticAgent state dict
-        manifest.json      — {iter, env_step, episodes_done, wandb_run_id}
+Cross-task evaluation: when evaluating task j ≤ N, we save the live
+RSSM weights, multiply in ``task_masks[j]`` to zero out positions that
+weren't selected for task j, run rollouts with task j's saved actor-
+critic + reward/termination heads, then restore the live weights.
 
-Why split at save/load time (and not refactor WorldModel into two
-nn.Modules): STORM's WorldModel owns a single Adam covering every
-parameter. Splitting the class would touch world_models.py and risk
-regressing the single-task trainer. Instead we filter the state dict
-by parameter-name prefix whenever we save or load. Adam moments for
-the SHARED core are NOT preserved across task boundaries (the
-optimizer is rebuilt when task heads are reset) — this is a minor
-regression that re-warms in a few thousand updates; acceptable
-tradeoff for keeping world_models.py untouched.
+Last task: no pruning. Stores a full mask (all 1.0) so eval still
+works through the same code path.
+
+Why this matters for STORM specifically (vs dreamer): STORM's
+``WorldModel.update`` packs forward + backward + optimizer step into
+one method, so a clean PackNet hook needs a wrapper. We provide
+:func:`world_model_update_with_packnet`, which mirrors ``update``'s
+body and inserts ``apply_gradient_mask`` between unscale and clip,
+plus ``apply_weight_mask`` after the optimizer step. The agent
+(actor-critic) is fresh per task, so its updates are unmodified.
 
 Example:
-    python train_metaworld_sequential.py \\
+    python train_metaworld_sequential_packnet.py \\
         --tasks metaworld_drawer-open-v3 metaworld_pick-place-v3 \\
         --task-steps 200000 500000 \\
-        --logdir ./runs/seq_storm \\
+        --task-buffer-sizes 25000 62500 \\
+        --packnet-prune-ratio 0.75 \\
+        --packnet-retrain-ratio 0.1 \\
+        --logdir ./runs/seq_storm_packnet \\
         --config_path config_files/STORM_metaworld.yaml \\
         --wandb-entity haoyu-a2i \\
-        --wandb-project Metaworld_STORM_Sequential
+        --wandb-project Metaworld_STORM_Sequential_PackNet
 """
 import argparse
-import copy
 import gc
 import json
 import os
-import re
 import sys
+import time as _time
 import warnings
 from collections import deque
 from pathlib import Path
@@ -59,6 +64,8 @@ from einops import rearrange
 from tqdm.auto import tqdm
 
 _HERE = Path(__file__).resolve().parent
+_STORM_ROOT = _HERE.parent
+sys.path.insert(0, str(_STORM_ROOT))
 sys.path.insert(0, str(_HERE))
 
 import agents
@@ -69,7 +76,10 @@ from sub_models.world_models import (
     RewardDecoder,
     TerminationDecoder,
 )
+from sub_models.attention_blocks import get_subsequent_mask_with_batch_length
 from utils import Logger, load_config, seed_np_torch
+
+from packnet import PackNetManager  # local module
 
 try:
     import wandb
@@ -78,12 +88,10 @@ except ImportError:  # pragma: no cover
 
 
 # ===========================================================================
-#  wandb-aware logger wrapper (copied verbatim from train_metaworld.py)
+#  Logger wrappers (verbatim from train_metaworld_sequential.py)
 # ===========================================================================
 
 class WandbTBLogger:
-    """Wraps STORM's TensorBoard Logger and mirrors scalars to wandb."""
-
     def __init__(self, tb_logger: Logger, use_wandb: bool):
         self._tb = tb_logger
         self._use_wandb = use_wandb and wandb is not None
@@ -111,13 +119,6 @@ class WandbTBLogger:
 
 
 class PrefixedLogger:
-    """Wraps WandbTBLogger to prefix every scalar key with a task tag.
-
-    Used for per-task eval logging so wandb shows one continuous curve
-    per task (e.g. eval/task1_drawer-open-v3/episode_reward) that spans
-    the full sequential run.
-    """
-
     def __init__(self, real_logger: WandbTBLogger, prefix: str):
         self._real = real_logger
         self._prefix = prefix
@@ -126,18 +127,12 @@ class PrefixedLogger:
         self._real.log(f"{self._prefix}/{tag}", value)
 
     def commit(self, step=None):
-        # Per-eval flush is handled by the caller of the real logger.
         pass
 
 
 # ===========================================================================
-#  World-model checkpoint split/merge
+#  World-model checkpoint split/merge (verbatim)
 # ===========================================================================
-# The shared core = everything in WorldModel.state_dict() EXCEPT the two
-# task-specific decoders. Anything new added to WorldModel later (e.g. an
-# extra auxiliary head) will automatically be treated as shared unless its
-# attribute name matches one of these prefixes — caveat noted in case
-# future STORM variants add more heads.
 
 TASK_HEAD_PREFIXES = ("reward_decoder.", "termination_decoder.")
 
@@ -147,7 +142,6 @@ def _is_task_head_key(k: str) -> bool:
 
 
 def split_world_model_state_dict(sd: dict):
-    """Return (shared_sd, task_heads_sd)."""
     shared = {k: v for k, v in sd.items() if not _is_task_head_key(k)}
     heads = {k: v for k, v in sd.items() if _is_task_head_key(k)}
     return shared, heads
@@ -160,11 +154,7 @@ def save_world_model_split(world_model, rssm_path: Path, heads_path: Path):
 
 
 def load_rssm_into(world_model, rssm_path: Path):
-    """Load the shared core into an existing WorldModel. Task-head params
-    in the current model are left as-is."""
     shared = torch.load(rssm_path, map_location="cuda")
-    # strict=False because shared_sd is missing reward/termination keys.
-    # We then assert nothing unexpected went missing from the shared set.
     result = world_model.load_state_dict(shared, strict=False)
     bad_missing = [k for k in result.missing_keys if not _is_task_head_key(k)]
     if bad_missing:
@@ -173,21 +163,16 @@ def load_rssm_into(world_model, rssm_path: Path):
         )
     if result.unexpected_keys:
         raise RuntimeError(
-            f"rssm.pt had unexpected keys (should only be shared-core): "
-            f"{result.unexpected_keys[:5]}..."
+            f"rssm.pt had unexpected keys: {result.unexpected_keys[:5]}..."
         )
 
 
 def load_task_heads_into(world_model, heads_path: Path):
-    """Load reward/termination decoder weights into an existing WorldModel."""
     heads = torch.load(heads_path, map_location="cuda")
-    # Target keys must all be task-head keys.
     bad = [k for k in heads if not _is_task_head_key(k)]
     if bad:
         raise RuntimeError(f"task_heads.pt contained non-task-head keys: {bad[:5]}")
     result = world_model.load_state_dict(heads, strict=False)
-    # Missing keys will be everything that ISN'T a task head — that's expected.
-    # But any unexpected keys would indicate a mismatch.
     if result.unexpected_keys:
         raise RuntimeError(
             f"task_heads.pt had unexpected keys: {result.unexpected_keys[:5]}"
@@ -195,19 +180,7 @@ def load_task_heads_into(world_model, heads_path: Path):
 
 
 def reset_task_heads(world_model, conf):
-    """Rebuild reward/termination decoders in place while PRESERVING the
-    shared core's Adam moments.
-
-    Why: discarding Adam (m, v) for already-trained weights makes the first
-    few hundred updates effectively run at the maximum step size lr·sign(g),
-    because v starts at zero and the bias-corrected ratio m̂/√v̂ saturates
-    near ±1 per element. On a freshly-init network that's fine; on a trained
-    encoder/transformer it wrecks task-1 representations within a few
-    hundred steps. We splice the optimizer's param group instead: drop the
-    OLD heads' state entries, swap in fresh head modules, append their
-    params (which start with empty Adam state). Shared-core entries in
-    optimizer.state are untouched.
-    """
+    """Surgical optimizer splice — preserve shared-core Adam moments."""
     hidden = int(conf.Models.WorldModel.TransformerHiddenDim)
     stoch_flat = int(world_model.stoch_flattened_dim)
 
@@ -227,21 +200,6 @@ def reset_task_heads(world_model, conf):
         transformer_hidden_dim=hidden,
     ).cuda()
 
-    # Zero-init the OUTPUT layer of each fresh head so they predict exactly
-    # zero on the first forward pass. Without this, Kaiming-default init
-    # produces random logits over the 255 SymLogTwoHot bins; the cross-
-    # entropy against real (small) reward targets on the first batch is
-    # ~log(255)·B·T, and the gradient backprops through the shared
-    # transformer via dist_feat — shocking the trained encoder/transformer
-    # into an AMP-overflow regime that GradScaler never recovers from
-    # (manifests as WorldModel/skipped_step pinned at 1.0 forever and
-    # actor-critic flat-lining on task 2). Mirrors dreamer's outscale=0
-    # for the reward and continuation heads.
-    torch.nn.init.zeros_(world_model.reward_decoder.head.weight)
-    torch.nn.init.zeros_(world_model.reward_decoder.head.bias)
-    torch.nn.init.zeros_(world_model.termination_decoder.head[0].weight)
-    torch.nn.init.zeros_(world_model.termination_decoder.head[0].bias)
-
     opt = world_model.optimizer
     pg = opt.param_groups[0]
     for p in old_head_params:
@@ -250,92 +208,8 @@ def reset_task_heads(world_model, conf):
     pg["params"].extend(world_model.reward_decoder.parameters())
     pg["params"].extend(world_model.termination_decoder.parameters())
 
-    # Fresh GradScaler at the boundary. The scale factor adapts per-step
-    # via overflow detection; if a previous task wound it down to a low
-    # value, starting task 2 with a stale low scale unnecessarily
-    # restricts AMP precision. Cheap insurance, not load-bearing.
-    world_model.scaler = torch.cuda.amp.GradScaler(enabled=world_model.use_amp)
-
-PREFILL_ENV_STEPS = 5000
-
-
-def prefill_replay_buffer(replay_buffer, vec_env, prefill_steps,
-                          save_episodes, episode_dir, num_envs, use_proprio):
-    """Seed the replay buffer with uniform-random transitions before training.
-
-    Mirrors dreamer's per-task prefill phase. Without this, STORM's task-2+
-    reward decoder fits to a tiny initial buffer and collapses to "predict
-    zero", which kills the actor-critic advantage signal until the buffer
-    finally accumulates enough variety (~10k env-steps in practice).
-    """
-    if prefill_steps <= 0:
-        return 0
-
-    print(colorama.Fore.CYAN
-          + f">>> Prefilling replay buffer with {prefill_steps} random env-steps"
-          + colorama.Style.RESET_ALL)
-
-    obs, info = vec_env.reset()
-    proprio = (np.asarray(info["proprio"], dtype=np.float32)
-               if use_proprio and "proprio" in info else None)
-    current_episode = [
-        {"obs": [], "action": [], "reward": [], "termination": [], "proprio": []}
-        for _ in range(num_envs)
-    ]
-    iters = max(1, prefill_steps // num_envs)
-    for _ in tqdm(range(iters), desc=">>> Prefill", unit="step",
-                  dynamic_ncols=True, leave=False):
-        action = vec_env.action_space.sample().astype(np.float32)
-        next_obs, reward, done, truncated, info = vec_env.step(action)
-        next_proprio = (np.asarray(info["proprio"], dtype=np.float32)
-                        if use_proprio and "proprio" in info else None)
-        term_signal = np.logical_or(done, info["life_loss"])
-        replay_buffer.append(
-            obs, action, reward, term_signal,
-            proprio=proprio if use_proprio else None,
-        )
-        if save_episodes:
-            for i in range(num_envs):
-                current_episode[i]["obs"].append(obs[i])
-                current_episode[i]["action"].append(action[i])
-                current_episode[i]["reward"].append(np.float32(reward[i]))
-                current_episode[i]["termination"].append(np.float32(term_signal[i]))
-                if use_proprio and proprio is not None:
-                    current_episode[i]["proprio"].append(proprio[i])
-        done_flag = np.logical_or(done, truncated)
-        if done_flag.any():
-            for i in range(num_envs):
-                if done_flag[i]:
-                    if save_episodes and current_episode[i]["reward"]:
-                        ep = {
-                            "obs": np.stack(current_episode[i]["obs"], axis=0),
-                            "action": np.stack(current_episode[i]["action"], axis=0),
-                            "reward": np.asarray(current_episode[i]["reward"], dtype=np.float32),
-                            "termination": np.asarray(current_episode[i]["termination"], dtype=np.float32),
-                        }
-                        if use_proprio:
-                            ep["proprio"] = np.stack(current_episode[i]["proprio"], axis=0)
-                        try:
-                            replay_buffer.save_episode(episode_dir, ep)
-                        except Exception as e:
-                            print(f"[prefill] save_episode failed: {e}")
-                        current_episode[i] = {
-                            "obs": [], "action": [], "reward": [],
-                            "termination": [], "proprio": [],
-                        }
-        obs = next_obs
-        proprio = next_proprio
-    actual_steps = iters * num_envs
-    print(colorama.Fore.GREEN
-          + f">>> Prefill done: buffer length = {len(replay_buffer)} "
-            f"({actual_steps} env-steps collected)"
-          + colorama.Style.RESET_ALL)
-    return actual_steps
-
 
 def snapshot_task_heads(world_model):
-    """Return CPU-side copies of the current reward/termination state dicts
-    so we can restore them after a temporary swap during cross-task eval."""
     sd = {}
     for k, v in world_model.state_dict().items():
         if _is_task_head_key(k):
@@ -349,7 +223,112 @@ def restore_task_heads(world_model, snapshot_sd: dict):
 
 
 # ===========================================================================
-#  Sequential progress tracking (JSON)
+#  PackNet-augmented WorldModel update
+# ===========================================================================
+
+def world_model_update_with_packnet(
+    world_model, obs, action, reward, termination,
+    packnet_manager: PackNetManager,
+    logger=None, proprio=None,
+):
+    """Mirror of ``WorldModel.update`` with PackNet hooks injected.
+
+    Hook locations (mapped to STORM's update body):
+      1. After ``scaler.unscale_(optimizer)``, before ``clip_grad_norm_``:
+         call ``packnet_manager.apply_gradient_mask`` to zero gradients on
+         frozen weights and (post-task-1) shared params.
+      2. After ``scaler.step(optimizer)``, before ``scaler.update``: call
+         ``packnet_manager.apply_weight_mask`` to re-zero pruned weights
+         (no-op outside retrain mode).
+
+    Why a parallel implementation rather than monkey-patching: STORM packs
+    forward + backward + step into one method, and the hook needs to fire
+    BETWEEN unscale and step. Wrapping at method boundaries can't reach
+    inside.
+    """
+    world_model.train()
+    batch_size, batch_length = obs.shape[:2]
+    use_amp = world_model.use_amp
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=use_amp):
+        embedding = world_model._encode_combined(obs, proprio)
+        post_logits = world_model.dist_head.forward_post(embedding)
+        z = world_model.stright_throught_gradient(post_logits, "random_sample")
+        flat_z = world_model.flatten_sample(z)
+
+        obs_hat = world_model.image_decoder(flat_z)
+        if world_model.use_proprio:
+            proprio_hat = world_model.proprio_decoder(flat_z)
+
+        mask = get_subsequent_mask_with_batch_length(batch_length, flat_z.device)
+        dist_feat = world_model.storm_transformer(flat_z, action, mask)
+        prior_logits = world_model.dist_head.forward_prior(dist_feat)
+        reward_hat = world_model.reward_decoder(dist_feat)
+        term_hat = world_model.termination_decoder(dist_feat)
+
+        recon_loss = world_model.mse_loss_func(obs_hat, obs)
+        if world_model.use_proprio:
+            proprio_recon_loss = ((proprio_hat - proprio) ** 2).sum(dim=-1).mean()
+        else:
+            proprio_recon_loss = torch.tensor(0.0, device=obs.device)
+        reward_loss = world_model.symlog_twohot_loss_func(reward_hat, reward)
+        termination_loss = world_model.bce_with_logits_loss_func(term_hat, termination)
+        dyn_loss, dyn_real_kl = world_model.categorical_kl_div_loss(
+            post_logits[:, 1:].detach(), prior_logits[:, :-1],
+        )
+        rep_loss, rep_real_kl = world_model.categorical_kl_div_loss(
+            post_logits[:, 1:], prior_logits[:, :-1].detach(),
+        )
+        total_loss = (
+            recon_loss + proprio_recon_loss + reward_loss + termination_loss
+            + 0.5 * dyn_loss + 0.1 * rep_loss
+        )
+
+    if not torch.isfinite(total_loss):
+        stats = {
+            "recon": recon_loss.item(), "reward": reward_loss.item(),
+            "term": termination_loss.item(), "dyn": dyn_loss.item(),
+            "rep": rep_loss.item(),
+        }
+        raise RuntimeError(f"Non-finite world-model loss: {stats}")
+
+    world_model.scaler.scale(total_loss).backward()
+    world_model.scaler.unscale_(world_model.optimizer)
+    # >>> PackNet hook: zero grads on frozen + shared params (after unscale,
+    # before clip; matches dreamer's apply_gradient_mask placement).
+    if packnet_manager is not None:
+        packnet_manager.apply_gradient_mask(world_model)
+    grad_norm = torch.nn.utils.clip_grad_norm_(
+        world_model.parameters(), max_norm=100.0,
+    )
+    if torch.isfinite(grad_norm):
+        world_model.scaler.step(world_model.optimizer)
+    elif logger is not None:
+        logger.log("WorldModel/skipped_step", 1.0)
+    world_model.scaler.update()
+    # >>> PackNet hook: re-zero pruned weights revived by Adam momentum
+    # (no-op when not in retrain mode).
+    if packnet_manager is not None:
+        packnet_manager.apply_weight_mask(world_model)
+    world_model.optimizer.zero_grad(set_to_none=True)
+
+    if logger is not None:
+        logger.log("WorldModel/reconstruction_loss", recon_loss.item())
+        if world_model.use_proprio:
+            logger.log("WorldModel/proprio_recon_loss", proprio_recon_loss.item())
+        logger.log("WorldModel/reward_loss", reward_loss.item())
+        logger.log("WorldModel/termination_loss", termination_loss.item())
+        logger.log("WorldModel/dynamics_loss", dyn_loss.item())
+        logger.log("WorldModel/dynamics_real_kl_div", dyn_real_kl.item())
+        logger.log("WorldModel/representation_loss", rep_loss.item())
+        logger.log("WorldModel/representation_real_kl_div", rep_real_kl.item())
+        logger.log("WorldModel/total_loss", total_loss.item())
+        logger.log("WorldModel/grad_norm", grad_norm.item())
+        logger.log("WorldModel/reward_batch_absmax", reward.abs().max().item())
+
+
+# ===========================================================================
+#  Sequential progress tracking
 # ===========================================================================
 
 def _progress_path(base_logdir: Path) -> Path:
@@ -388,7 +367,7 @@ def load_sequential_progress(base_logdir: Path):
 
 
 # ===========================================================================
-#  Model builders (verbatim from train_metaworld.py)
+#  Model builders
 # ===========================================================================
 
 def build_world_model(conf, action_dim, proprio_dim):
@@ -421,23 +400,16 @@ def build_agent(conf, action_dim):
 
 
 # ===========================================================================
-#  Cross-task evaluation
+#  Cross-task evaluation (PackNet eval-mask aware)
 # ===========================================================================
 
 @torch.no_grad()
 def _rollout_one_episode(world_model, agent, env, image_size):
-    """Run a single greedy episode using the STORM rollout pipeline.
-
-    Mirrors the act block in train_metaworld.py lines 263-299, but runs
-    in ``greedy=True`` mode and always has the world model ready (no
-    random-action prefill).
-    """
     world_model.eval()
     agent.eval()
 
     obs, info = env.reset()
     proprio = np.asarray(info["proprio"], dtype=np.float32) if "proprio" in info else None
-    # vec_env returns (N, H, W, C); proprio is (N, D).
 
     context_obs = deque(maxlen=16)
     context_action = deque(maxlen=16)
@@ -450,9 +422,6 @@ def _rollout_one_episode(world_model, agent, env, image_size):
 
     while not done:
         if len(context_action) == 0:
-            # No context yet; random first action (one env step of noise is
-            # negligible compared to greedy behavior over the rest of the
-            # episode, and matches the bootstrap the training loop uses).
             action = env.action_space.sample().astype(np.float32)
         else:
             ctx_obs = torch.cat(list(context_obs), dim=1)
@@ -470,7 +439,6 @@ def _rollout_one_episode(world_model, agent, env, image_size):
                 greedy=True,
             )
 
-        # Push the current obs/proprio/action into the context buffers.
         ctx_push = rearrange(
             torch.tensor(obs, dtype=torch.float32, device="cuda"),
             "B H W C -> B 1 C H W",
@@ -484,19 +452,15 @@ def _rollout_one_episode(world_model, agent, env, image_size):
 
         obs, reward, term, trunc, info = env.step(action)
         proprio = np.asarray(info["proprio"], dtype=np.float32) if "proprio" in info else None
-        # vec env: reward, term, trunc are arrays of shape (N,)
         total_reward += float(np.asarray(reward).sum())
         steps += 1
-        # Meta-World "success" may appear in info under different keys.
         succ_val = 0.0
-        # info keys from SyncVectorEnv are per-env lists; grab index 0.
         for key in ("success", "is_success"):
             if key in info:
                 v = info[key]
                 if hasattr(v, "__len__"):
                     v = v[0]
                 succ_val = max(succ_val, float(v))
-        # Also check the per-env final_info if present.
         fi = info.get("final_info") if isinstance(info, dict) else None
         if fi is not None:
             for fi_i in (fi if hasattr(fi, "__iter__") else [fi]):
@@ -513,14 +477,16 @@ def _rollout_one_episode(world_model, agent, env, image_size):
 def evaluate_all_tasks_so_far(
     task_idx, tasks, conf, world_model, agent,
     eval_env_cache, base_logdir, logger, episodes, global_env_step,
+    packnet_manager: PackNetManager,
 ):
-    """Evaluate the current agent on task task_idx AND every previous task.
+    """Evaluate task_idx + every previous task.
 
-    For previous tasks, load their saved task_heads + actor_critic
-    from disk, run eval, then RESTORE the current task's heads so
-    training can resume unperturbed.
+    For each task j, if a PackNet mask exists for j we save the live
+    shared-core weights, multiply in ``task_masks[j]`` to zero non-j
+    positions, run rollouts, then restore. For the current task during
+    in-task evaluation (before the prune step at end-of-task), no mask
+    yet exists for ``task_idx`` so no masking is applied.
     """
-    # Snapshot the CURRENT task heads so we can restore after any swap.
     current_heads = snapshot_task_heads(world_model)
 
     for j in range(task_idx + 1):
@@ -528,7 +494,6 @@ def evaluate_all_tasks_so_far(
         prefix = f"eval/task{j+1}_{task_name}"
         prefixed = PrefixedLogger(logger, prefix)
 
-        # Get or build the eval env for task j.
         if j not in eval_env_cache:
             eval_env_cache[j] = mw_env.build_metaworld_vec_env(
                 task_name=task_name,
@@ -541,10 +506,10 @@ def evaluate_all_tasks_so_far(
             )
         env_j = eval_env_cache[j]
 
+        tmp_agent = None
         if j == task_idx:
             use_agent = agent
         else:
-            # Swap in task-j's reward/termination + build a temp agent.
             prev_task_dir = base_logdir / f"task{j+1}_{tasks[j]}"
             heads_path = prev_task_dir / "task_heads.pt"
             ac_path = prev_task_dir / "actor_critic.pt"
@@ -560,9 +525,13 @@ def evaluate_all_tasks_so_far(
             tmp_agent.eval()
             use_agent = tmp_agent
 
-        rewards = []
-        successes = []
-        lengths = []
+        # Apply PackNet eval mask if a mask exists for j.
+        saved_rssm = None
+        if (packnet_manager is not None and j in packnet_manager.task_masks):
+            saved_rssm = packnet_manager.save_rssm_weights(world_model)
+            packnet_manager.apply_eval_mask(world_model, j)
+
+        rewards, successes, lengths = [], [], []
         try:
             for _ in range(max(1, int(episodes))):
                 r, s, suc = _rollout_one_episode(
@@ -573,10 +542,13 @@ def evaluate_all_tasks_so_far(
                 lengths.append(s)
                 successes.append(suc)
         finally:
+            if saved_rssm is not None:
+                packnet_manager.restore_rssm_weights(world_model, saved_rssm)
+                del saved_rssm
             if j != task_idx:
-                # Always restore current task heads even if eval raised.
                 restore_task_heads(world_model, current_heads)
-                del tmp_agent  # noqa: F821
+                if tmp_agent is not None:
+                    del tmp_agent
 
         mean_r = float(np.mean(rewards))
         mean_s = float(np.mean(successes))
@@ -593,18 +565,19 @@ def evaluate_all_tasks_so_far(
             f"@g={global_env_step}"
         )
 
-    # Flush eval scalars to wandb at the current global step.
     if hasattr(logger, "commit"):
         logger.commit(step=int(global_env_step))
 
 
 # ===========================================================================
-#  Per-task training loop (adapted from joint_train_world_model_agent)
+#  Per-task training loop with prune + retrain phase
 # ===========================================================================
 
 def train_one_task(
     task_idx, num_tasks, tasks, conf,
     world_model, agent, replay_buffer,
+    packnet_manager: PackNetManager,
+    retrain_env_steps: int,
     logger, base_logdir,
     global_env_step_offset, max_env_steps,
     eval_every_env_steps, eval_episodes,
@@ -613,20 +586,20 @@ def train_one_task(
     episode_dir=None,
     buffer_max_length=None,
 ):
-    """Run STORM's joint training loop for a single task.
+    """STORM training loop with PackNet prune+retrain at task boundary.
 
-    Step counters:
-      - local iter (tqdm bar): 0 .. max_env_steps / num_envs
-      - global env step: global_env_step_offset + total_steps * num_envs
-        — this is what wandb sees, so the train curve is monotonic.
+    Phase 1 (main training):  iters [start_iter, total_iters_main)
+    Phase 2 (prune + retrain): only if not the last task
+        - prune() to magnitude-mask task's free weights
+        - run additional ``retrain_iters`` iterations with PackNet in
+          retrain mode (frozen + pruned weights stay zeroed every step)
+    Phase 3 (freeze): freeze surviving weights into the cumulative mask.
 
-    Saves split checkpoints (rssm.pt, task_heads.pt, actor_critic.pt)
-    at save_every_env_steps under <base_logdir>/task{N}_<name>/.
-
-    If ``episode_dir`` is given, completed episodes are written to disk
-    as ``.npz`` files (for within-task resume) and the directory is
-    FIFO-pruned to ``buffer_max_length`` transitions at each save
-    interval.
+    The retrain phase uses the same ``vec_env``, replay buffer, and
+    context buffers as the main phase — no environment teardown happens
+    between phases. World-model updates during retrain still call
+    :func:`world_model_update_with_packnet`; the only thing that changes
+    is ``packnet_manager._retrain_mode``.
     """
     task_name = tasks[task_idx]
     task_dir = base_logdir / f"task{task_idx+1}_{task_name}"
@@ -662,6 +635,15 @@ def train_one_task(
     print(colorama.Fore.YELLOW + f"Current env: {task_name}"
           + colorama.Style.RESET_ALL)
 
+    if packnet_manager is not None and packnet_manager.num_tasks_packed > 0:
+        n_frozen = sum(v.sum().item() for v in packnet_manager.frozen_mask.values())
+        n_total = sum(v.numel() for v in packnet_manager.frozen_mask.values())
+        print(colorama.Fore.CYAN
+              + f">>> PackNet: {int(n_frozen):,}/{int(n_total):,} weight params "
+                f"frozen from {packnet_manager.num_tasks_packed} previous task(s); "
+                f"shared params frozen={packnet_manager._shared_params_frozen}"
+              + colorama.Style.RESET_ALL)
+
     sum_reward = np.zeros(num_envs)
     episode_steps = np.zeros(num_envs, dtype=np.int64)
     episodes_done = episodes_done_init
@@ -673,19 +655,18 @@ def train_one_task(
     context_action = deque(maxlen=16)
     context_proprio = deque(maxlen=16)
 
-    # Per-env episode accumulator for on-disk persistence (matches the
-    # single-task trainer's save_episode pipeline).
     current_episode = [
         {"obs": [], "action": [], "reward": [], "termination": [], "proprio": []}
         for _ in range(num_envs)
     ]
 
-    total_iters = max_env_steps // num_envs
+    total_iters_main = max_env_steps // num_envs
+    retrain_iters = retrain_env_steps // num_envs if retrain_env_steps > 0 else 0
     eval_every_iters = max(1, eval_every_env_steps // num_envs)
     save_every_iters = max(1, save_every_env_steps // num_envs)
 
     pbar = tqdm(
-        total=total_iters, initial=start_iter,
+        total=total_iters_main, initial=start_iter,
         desc=f">>> T{task_idx+1}/{num_tasks} {task_name}",
         unit="step", dynamic_ncols=True,
     )
@@ -695,241 +676,331 @@ def train_one_task(
     def _global_step(iter_i):
         return global_env_step_offset + iter_i * num_envs
 
-    try:
-        for total_steps in range(start_iter, total_iters):
-            gstep = _global_step(total_steps)
+    def _do_step(total_steps, log_train_curve, do_eval, do_save):
+        """Single training-loop iteration (act + WM update + agent update +
+        optional eval/save). Used by both main and retrain phases.
+        """
+        nonlocal current_obs, current_proprio, episodes_done, sum_reward, episode_steps
+        gstep = _global_step(total_steps)
 
-            # --------- act ---------
-            if replay_buffer.ready():
-                world_model.eval()
-                agent.eval()
-                with torch.no_grad():
-                    if len(context_action) == 0:
-                        action = vec_env.action_space.sample().astype(np.float32)
-                    else:
-                        ctx_obs = torch.cat(list(context_obs), dim=1)
-                        ctx_proprio = None
-                        if replay_buffer.use_proprio:
-                            ctx_proprio = torch.cat(list(context_proprio), dim=1)
-                        context_latent = world_model.encode_obs(ctx_obs, ctx_proprio)
-                        mca = np.stack(list(context_action), axis=1)
-                        mca = torch.tensor(mca, dtype=torch.float32, device="cuda")
-                        prior_flat, last_dist_feat = world_model.calc_last_dist_feat(
-                            context_latent, mca,
-                        )
-                        action = agent.sample_as_env_action(
-                            torch.cat([prior_flat, last_dist_feat], dim=-1),
-                            greedy=False,
-                        )
-                ctx_push = rearrange(
-                    torch.tensor(current_obs, dtype=torch.float32, device="cuda"),
-                    "B H W C -> B 1 C H W",
-                ) / 255.0
-                context_obs.append(ctx_push)
-                if replay_buffer.use_proprio:
-                    context_proprio.append(
-                        torch.tensor(current_proprio, dtype=torch.float32,
-                                     device="cuda").unsqueeze(1)
-                    )
-                context_action.append(action)
-            else:
-                action = vec_env.action_space.sample().astype(np.float32)
-
-            obs, reward, done, truncated, info = vec_env.step(action)
-            next_proprio = np.asarray(info["proprio"], dtype=np.float32)
-
-            term_signal = np.logical_or(done, info["life_loss"])
-            replay_buffer.append(
-                current_obs, action, reward, term_signal,
-                proprio=current_proprio if replay_buffer.use_proprio else None,
-            )
-
-            # Mirror the transition into the per-env episode accumulator so
-            # it can be flushed to disk on episode end.
-            if save_episodes:
-                for i in range(num_envs):
-                    current_episode[i]["obs"].append(current_obs[i])
-                    current_episode[i]["action"].append(action[i])
-                    current_episode[i]["reward"].append(np.float32(reward[i]))
-                    current_episode[i]["termination"].append(np.float32(term_signal[i]))
+        # --------- act ---------
+        if replay_buffer.ready():
+            world_model.eval()
+            agent.eval()
+            with torch.no_grad():
+                if len(context_action) == 0:
+                    action = vec_env.action_space.sample().astype(np.float32)
+                else:
+                    ctx_obs = torch.cat(list(context_obs), dim=1)
+                    ctx_proprio = None
                     if replay_buffer.use_proprio:
-                        current_episode[i]["proprio"].append(current_proprio[i])
+                        ctx_proprio = torch.cat(list(context_proprio), dim=1)
+                    context_latent = world_model.encode_obs(ctx_obs, ctx_proprio)
+                    mca = np.stack(list(context_action), axis=1)
+                    mca = torch.tensor(mca, dtype=torch.float32, device="cuda")
+                    prior_flat, last_dist_feat = world_model.calc_last_dist_feat(
+                        context_latent, mca,
+                    )
+                    action = agent.sample_as_env_action(
+                        torch.cat([prior_flat, last_dist_feat], dim=-1),
+                        greedy=False,
+                    )
+            ctx_push = rearrange(
+                torch.tensor(current_obs, dtype=torch.float32, device="cuda"),
+                "B H W C -> B 1 C H W",
+            ) / 255.0
+            context_obs.append(ctx_push)
+            if replay_buffer.use_proprio:
+                context_proprio.append(
+                    torch.tensor(current_proprio, dtype=torch.float32,
+                                 device="cuda").unsqueeze(1)
+                )
+            context_action.append(action)
+        else:
+            action = vec_env.action_space.sample().astype(np.float32)
 
-            sum_reward += reward
-            episode_steps += 1
-            done_flag = np.logical_or(done, truncated)
-            if done_flag.any():
-                for i in range(num_envs):
-                    if done_flag[i]:
-                        # Single continuous train/* curve across tasks.
+        obs, reward, done, truncated, info = vec_env.step(action)
+        next_proprio = np.asarray(info["proprio"], dtype=np.float32)
+
+        term_signal = np.logical_or(done, info["life_loss"])
+        replay_buffer.append(
+            current_obs, action, reward, term_signal,
+            proprio=current_proprio if replay_buffer.use_proprio else None,
+        )
+
+        if save_episodes:
+            for i in range(num_envs):
+                current_episode[i]["obs"].append(current_obs[i])
+                current_episode[i]["action"].append(action[i])
+                current_episode[i]["reward"].append(np.float32(reward[i]))
+                current_episode[i]["termination"].append(np.float32(term_signal[i]))
+                if replay_buffer.use_proprio:
+                    current_episode[i]["proprio"].append(current_proprio[i])
+
+        sum_reward += reward
+        episode_steps += 1
+        done_flag = np.logical_or(done, truncated)
+        if done_flag.any():
+            for i in range(num_envs):
+                if done_flag[i]:
+                    if log_train_curve:
                         logger.log("train/episode_reward", float(sum_reward[i]))
                         logger.log("train/episode_steps", int(episode_steps[i]))
                         logger.log("train/current_task_idx", task_idx + 1)
                         logger.log("replay_buffer/length", len(replay_buffer))
-                        episodes_done += 1
-                        sum_reward[i] = 0
-                        episode_steps[i] = 0
+                    episodes_done += 1
+                    sum_reward[i] = 0
+                    episode_steps[i] = 0
 
-                        if save_episodes and current_episode[i]["reward"]:
-                            ep = {
-                                "obs": np.stack(current_episode[i]["obs"], axis=0),
-                                "action": np.stack(current_episode[i]["action"], axis=0),
-                                "reward": np.asarray(current_episode[i]["reward"], dtype=np.float32),
-                                "termination": np.asarray(current_episode[i]["termination"], dtype=np.float32),
-                            }
-                            if replay_buffer.use_proprio:
-                                ep["proprio"] = np.stack(current_episode[i]["proprio"], axis=0)
-                            try:
-                                replay_buffer.save_episode(episode_dir, ep)
-                            except Exception as e:
-                                print(f"[seq_trainer] save_episode failed: {e}")
-                            current_episode[i] = {
-                                "obs": [], "action": [], "reward": [],
-                                "termination": [], "proprio": [],
-                            }
-                context_obs.clear()
-                context_action.clear()
-                context_proprio.clear()
+                    if save_episodes and current_episode[i]["reward"]:
+                        ep = {
+                            "obs": np.stack(current_episode[i]["obs"], axis=0),
+                            "action": np.stack(current_episode[i]["action"], axis=0),
+                            "reward": np.asarray(current_episode[i]["reward"], dtype=np.float32),
+                            "termination": np.asarray(current_episode[i]["termination"], dtype=np.float32),
+                        }
+                        if replay_buffer.use_proprio:
+                            ep["proprio"] = np.stack(current_episode[i]["proprio"], axis=0)
+                        try:
+                            replay_buffer.save_episode(episode_dir, ep)
+                        except Exception as e:
+                            print(f"[seq_packnet_trainer] save_episode failed: {e}")
+                        current_episode[i] = {
+                            "obs": [], "action": [], "reward": [],
+                            "termination": [], "proprio": [],
+                        }
+            context_obs.clear()
+            context_action.clear()
+            context_proprio.clear()
 
-            current_obs = obs
-            current_info = info
-            current_proprio = next_proprio
+        current_obs = obs
+        current_proprio = next_proprio
 
-            # --------- world model update ---------
-            if replay_buffer.ready() and (
-                total_steps % max(train_dyn_every // num_envs, 1) == 0
-            ):
-                sample = replay_buffer.sample(batch_size, demo_batch_size, batch_length)
-                if replay_buffer.use_proprio:
-                    s_obs, s_act, s_rew, s_term, s_prop = sample
-                    world_model.update(s_obs, s_act, s_rew, s_term,
-                                       logger=logger, proprio=s_prop)
-                else:
-                    s_obs, s_act, s_rew, s_term = sample
-                    world_model.update(s_obs, s_act, s_rew, s_term, logger=logger)
-
-            # --------- agent update (on imagined rollouts) ---------
-            if replay_buffer.ready() and (
-                total_steps % max(train_agent_every // num_envs, 1) == 0
-            ):
-                log_video = (total_steps % save_every_iters == 0)
-                sample = replay_buffer.sample(
-                    imagine_batch_size, imagine_demo_batch_size, imagine_context_length
+        # --------- world model update ---------
+        if replay_buffer.ready() and (
+            total_steps % max(train_dyn_every // num_envs, 1) == 0
+        ):
+            sample = replay_buffer.sample(batch_size, demo_batch_size, batch_length)
+            if replay_buffer.use_proprio:
+                s_obs, s_act, s_rew, s_term, s_prop = sample
+                world_model_update_with_packnet(
+                    world_model, s_obs, s_act, s_rew, s_term,
+                    packnet_manager=packnet_manager, logger=logger, proprio=s_prop,
                 )
-                if replay_buffer.use_proprio:
-                    s_obs, s_act, s_rew, s_term, s_prop = sample
-                else:
-                    s_obs, s_act, s_rew, s_term = sample
-                    s_prop = None
-                # imagine under no_grad so the rollout does not keep a
-                # graph through the world-model parameters — matches
-                # train_metaworld.world_model_imagine_data's @torch.no_grad
-                # decorator. Without this, agent.update() will try to
-                # backward through a graph the world-model's own backward
-                # has already freed.
-                with torch.no_grad():
-                    world_model.eval()
-                    agent.eval()
-                    latent, ac_action, rew_hat, term_hat = world_model.imagine_data(
-                        agent, s_obs, s_act,
-                        imagine_batch_size=imagine_batch_size + imagine_demo_batch_size,
-                        imagine_batch_length=imagine_batch_length,
-                        log_video=log_video,
-                        logger=logger,
-                        sample_proprio=s_prop,
-                    )
-                agent.update(
-                    latent=latent, action=ac_action,
-                    old_logprob=None, old_value=None,
-                    reward=rew_hat, termination=term_hat,
+            else:
+                s_obs, s_act, s_rew, s_term = sample
+                world_model_update_with_packnet(
+                    world_model, s_obs, s_act, s_rew, s_term,
+                    packnet_manager=packnet_manager, logger=logger,
+                )
+
+        # --------- agent update (on imagined rollouts) ---------
+        if replay_buffer.ready() and (
+            total_steps % max(train_agent_every // num_envs, 1) == 0
+        ):
+            log_video = do_save  # log video at save boundaries
+            sample = replay_buffer.sample(
+                imagine_batch_size, imagine_demo_batch_size, imagine_context_length
+            )
+            if replay_buffer.use_proprio:
+                s_obs, s_act, s_rew, s_term, s_prop = sample
+            else:
+                s_obs, s_act, s_rew, s_term = sample
+                s_prop = None
+            with torch.no_grad():
+                world_model.eval()
+                agent.eval()
+                latent, ac_action, rew_hat, term_hat = world_model.imagine_data(
+                    agent, s_obs, s_act,
+                    imagine_batch_size=imagine_batch_size + imagine_demo_batch_size,
+                    imagine_batch_length=imagine_batch_length,
+                    log_video=log_video,
                     logger=logger,
+                    sample_proprio=s_prop,
                 )
+            agent.update(
+                latent=latent, action=ac_action,
+                old_logprob=None, old_value=None,
+                reward=rew_hat, termination=term_hat,
+                logger=logger,
+            )
 
-            # --------- cross-task evaluation ---------
-            if total_steps > 0 and total_steps % eval_every_iters == 0:
-                evaluate_all_tasks_so_far(
-                    task_idx=task_idx,
-                    tasks=tasks,
-                    conf=conf,
-                    world_model=world_model,
-                    agent=agent,
-                    eval_env_cache=eval_env_cache,
-                    base_logdir=base_logdir,
-                    logger=logger,
-                    episodes=eval_episodes,
-                    global_env_step=gstep,
+        # --------- cross-task evaluation ---------
+        if do_eval:
+            evaluate_all_tasks_so_far(
+                task_idx=task_idx,
+                tasks=tasks,
+                conf=conf,
+                world_model=world_model,
+                agent=agent,
+                eval_env_cache=eval_env_cache,
+                base_logdir=base_logdir,
+                logger=logger,
+                episodes=eval_episodes,
+                global_env_step=gstep,
+                packnet_manager=packnet_manager,
+            )
+
+        # --------- checkpointing ---------
+        if do_save:
+            save_world_model_split(
+                world_model,
+                task_dir / "rssm.pt",
+                task_dir / "task_heads.pt",
+            )
+            torch.save(agent.state_dict(), task_dir / "actor_critic.pt")
+            manifest = {
+                "iter": int(total_steps),
+                "env_step": int(gstep),
+                "episodes_done": int(episodes_done),
+                "task_idx": int(task_idx),
+                "task_name": task_name,
+            }
+            (task_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+            if save_episodes and buffer_max_length is not None:
+                removed = ReplayBuffer.prune_episode_dir_to_cap(
+                    episode_dir, int(buffer_max_length),
                 )
+                if removed:
+                    print(f"[seq_packnet_trainer] pruned {removed} old episode "
+                          f"files (cap={buffer_max_length})")
 
-            # --------- checkpointing ---------
-            if total_steps % save_every_iters == 0 and total_steps > 0:
-                save_world_model_split(
-                    world_model,
-                    task_dir / "rssm.pt",
-                    task_dir / "task_heads.pt",
-                )
-                torch.save(agent.state_dict(), task_dir / "actor_critic.pt")
-                manifest = {
-                    "iter": int(total_steps),
-                    "env_step": int(gstep),
-                    "episodes_done": int(episodes_done),
-                    "task_idx": int(task_idx),
-                    "task_name": task_name,
-                }
-                (task_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        if hasattr(logger, "commit"):
+            logger.commit(step=int(gstep))
 
-                # FIFO-prune on-disk episodes so the directory footprint
-                # tracks the buffer cap for this task.
-                if save_episodes and buffer_max_length is not None:
-                    removed = ReplayBuffer.prune_episode_dir_to_cap(
-                        episode_dir, int(buffer_max_length),
-                    )
-                    if removed:
-                        print(f"[seq_trainer] pruned {removed} old episode "
-                              f"files (cap={buffer_max_length})")
+        return gstep
 
-            # --------- progress bar ---------
+    final_gstep = global_env_step_offset
+    try:
+        # ---- Phase 1: main training ----
+        for total_steps in range(start_iter, total_iters_main):
+            do_eval = total_steps > 0 and total_steps % eval_every_iters == 0
+            do_save = total_steps > 0 and total_steps % save_every_iters == 0
+            final_gstep = _do_step(
+                total_steps,
+                log_train_curve=True,
+                do_eval=do_eval,
+                do_save=do_save,
+            )
             if total_steps % 20 == 0:
                 pbar.set_postfix(
-                    env_steps=gstep,
+                    env_steps=final_gstep,
                     episodes=episodes_done,
                     buffer=len(replay_buffer),
+                    packed=packnet_manager.num_tasks_packed if packnet_manager else 0,
                 )
             pbar.update(1)
-
-            if hasattr(logger, "commit"):
-                logger.commit(step=int(gstep))
     finally:
         pbar.close()
-        # Close eval envs created for cross-task eval during this task.
-        for e in eval_env_cache.values():
+
+    # ---- Phase 2 + 3: prune, retrain, freeze (skip on the last task) ----
+    if packnet_manager is not None and task_idx < num_tasks - 1:
+        print("=" * 64)
+        print(colorama.Fore.CYAN
+              + f">>> PackNet: pruning + retraining task {task_idx+1} "
+                f"({task_name})"
+              + colorama.Style.RESET_ALL)
+        print("=" * 64)
+        t0 = _time.time()
+
+        task_mask = packnet_manager.prune(world_model, task_idx)
+
+        if retrain_iters > 0:
+            print(f">>> PackNet: retraining for {retrain_env_steps} env steps "
+                  f"({retrain_iters} iters)")
+            packnet_manager.start_retrain(task_mask)
+
+            # Move retrain masks onto cuda (prune created them on the
+            # world model's device already, but be defensive).
+            packnet_manager.to_device("cuda")
+
+            retrain_pbar = tqdm(
+                total=retrain_iters,
+                desc=f">>> T{task_idx+1} PackNet retrain",
+                unit="step", dynamic_ncols=True,
+            )
             try:
-                e.close()
-            except Exception:
-                pass
+                for r_iter in range(retrain_iters):
+                    total_steps = total_iters_main + r_iter
+                    final_gstep = _do_step(
+                        total_steps,
+                        log_train_curve=False,  # don't pollute train curve
+                        do_eval=False,
+                        do_save=False,
+                    )
+                    if r_iter % 20 == 0:
+                        retrain_pbar.set_postfix(
+                            env_steps=final_gstep,
+                            episodes=episodes_done,
+                            buffer=len(replay_buffer),
+                        )
+                    retrain_pbar.update(1)
+            finally:
+                retrain_pbar.close()
+                packnet_manager.end_retrain()
+
+        packnet_manager.freeze_task(task_mask, task_idx)
+        elapsed = _time.time() - t0
+
+        n_frozen = sum(v.sum().item() for v in packnet_manager.frozen_mask.values())
+        n_total = sum(v.numel() for v in packnet_manager.frozen_mask.values())
+        print(colorama.Fore.GREEN
+              + f">>> PackNet: pruned + retrained + frozen task {task_idx+1} "
+                f"in {elapsed:.1f}s"
+              + colorama.Style.RESET_ALL)
+
+        logger.log("packnet/frozen_ratio", n_frozen / max(n_total, 1))
+        logger.log("packnet/num_tasks_packed", float(packnet_manager.num_tasks_packed))
+        logger.log("packnet/prune_retrain_time_s", elapsed)
+        if hasattr(logger, "commit"):
+            logger.commit(step=int(final_gstep))
+
+        torch.save(packnet_manager.state_dict(),
+                   task_dir / f"packnet_state_task{task_idx+1}.pt")
+        print(f">>> PackNet: saved -> packnet_state_task{task_idx+1}.pt")
+    elif packnet_manager is not None and task_idx == num_tasks - 1:
+        # Last task: store full mask for symmetry — eval_all_tasks_so_far
+        # uses the same code path for every j.
+        task_mask = {}
+        for name, param in world_model.named_parameters():
+            if packnet_manager._is_prunable(name, param):
+                task_mask[name] = torch.ones_like(param.data)
+        packnet_manager.task_masks[task_idx] = task_mask
+        torch.save(packnet_manager.state_dict(),
+                   task_dir / f"packnet_state_task{task_idx+1}.pt")
+        print(f">>> PackNet: last task — stored full mask, no pruning.")
+
+    # ---- Cleanup environments ----
+    for e in eval_env_cache.values():
         try:
-            vec_env.close()
+            e.close()
         except Exception:
             pass
+    try:
+        vec_env.close()
+    except Exception:
+        pass
 
-    # Final split-checkpoint + manifest at task end.
+    # ---- Final per-task checkpoint + manifest ----
     save_world_model_split(
         world_model,
         task_dir / "rssm.pt",
         task_dir / "task_heads.pt",
     )
     torch.save(agent.state_dict(), task_dir / "actor_critic.pt")
-    final_iter = total_iters
-    final_gstep = _global_step(final_iter)
+    final_iter = total_iters_main + (retrain_iters if packnet_manager else 0)
+    final_gstep_out = _global_step(final_iter)
     (task_dir / "manifest.json").write_text(json.dumps({
         "iter": int(final_iter),
-        "env_step": int(final_gstep),
+        "env_step": int(final_gstep_out),
         "episodes_done": int(episodes_done),
         "task_idx": int(task_idx),
         "task_name": task_name,
         "final": True,
     }, indent=2))
 
-    return final_gstep
+    return final_gstep_out
 
 
 # ===========================================================================
@@ -958,6 +1029,19 @@ def main(args, remaining_opts):
 
     seed_np_torch(seed=args.seed)
 
+    if args.task_buffer_sizes is not None:
+        effective_task_buffer_sizes = [int(s) for s in args.task_buffer_sizes]
+    else:
+        effective_task_buffer_sizes = [
+            int(conf.JointTrainAgent.BufferMaxLength) for _ in range(num_tasks)
+        ]
+
+    # ---- PackNet manager (created up-front; resume can populate it) --------
+    packnet_manager = PackNetManager(
+        prune_ratio=args.packnet_prune_ratio,
+        task_head_prefixes=TASK_HEAD_PREFIXES,
+    )
+
     # ---- Resume detection ---------------------------------------------------
     global_env_step = 0
     resume_from = 0
@@ -980,6 +1064,20 @@ def main(args, remaining_opts):
             else:
                 break
 
+    if resume_from > 0:
+        for j in range(resume_from - 1, -1, -1):
+            pn_file = base_logdir / f"task{j+1}_{args.tasks[j]}" / f"packnet_state_task{j+1}.pt"
+            if pn_file.exists():
+                print(colorama.Fore.CYAN
+                      + f">>> PackNet: Loading state from {pn_file}"
+                      + colorama.Style.RESET_ALL)
+                packnet_manager.load_state_dict(
+                    torch.load(pn_file, map_location="cpu"),
+                )
+                print(f">>> PackNet: Restored {packnet_manager.num_tasks_packed} "
+                      f"packed task(s)")
+                break
+
     if resume_from >= num_tasks:
         print(colorama.Fore.GREEN
               + ">>> All tasks already completed. Nothing to do."
@@ -994,7 +1092,7 @@ def main(args, remaining_opts):
     active_run_id = None
     if use_wandb:
         run_name = args.wandb_run_name or (
-            f"seq_storm_{'-'.join(args.tasks)}_s{args.seed}"
+            f"seq_storm_packnet_{'-'.join(args.tasks)}_s{args.seed}"
         )
         wandb_kwargs = dict(
             entity=args.wandb_entity,
@@ -1004,11 +1102,14 @@ def main(args, remaining_opts):
             config=dict(
                 tasks=args.tasks,
                 task_steps=args.task_steps,
+                task_buffer_sizes=effective_task_buffer_sizes,
+                packnet_prune_ratio=args.packnet_prune_ratio,
+                packnet_retrain_ratio=args.packnet_retrain_ratio,
                 seed=args.seed,
                 config_path=args.config_path,
                 **{f"conf/{k}": str(v) for k, v in conf.items()},
             ),
-            tags=["sequential", "storm"] + list(args.tasks),
+            tags=["sequential", "storm", "packnet"] + list(args.tasks),
         )
         if effective_run_id is not None:
             wandb_kwargs["id"] = effective_run_id
@@ -1031,19 +1132,22 @@ def main(args, remaining_opts):
 
     # ---- Plan summary -------------------------------------------------------
     print("=" * 64)
-    print(colorama.Fore.CYAN + ">>> SEQUENTIAL STORM TRAINING"
+    print(colorama.Fore.CYAN + ">>> SEQUENTIAL STORM TRAINING WITH PACKNET"
           + colorama.Style.RESET_ALL)
     print("=" * 64)
     for i, (t, s) in enumerate(zip(args.tasks, args.task_steps)):
         mark = "  <-- resume here" if i == resume_from else ""
-        print(f"  Task {i+1}: {t}  env_steps={s}{mark}")
-    print(f"  Logdir:          {base_logdir}")
-    print(f"  Seed:            {args.seed}")
-    print(f"  Eval every:      {args.eval_every_steps} env steps")
-    print(f"  Eval episodes:   {args.eval_episodes}")
+        print(f"  Task {i+1}: {t}  env_steps={s}  buffer={effective_task_buffer_sizes[i]}{mark}")
+    print(f"  Logdir:                  {base_logdir}")
+    print(f"  Seed:                    {args.seed}")
+    print(f"  PackNet prune ratio:     {args.packnet_prune_ratio}")
+    print(f"  PackNet retrain ratio:   {args.packnet_retrain_ratio} "
+          f"(× per-task env steps)")
+    print(f"  Eval every:              {args.eval_every_steps} env steps")
+    print(f"  Eval episodes:           {args.eval_episodes}")
     print("=" * 64)
 
-    # ---- Action/proprio discovery via a dummy env --------------------------
+    # ---- Action/proprio discovery ------------------------------------------
     dummy_env = mw_env.build_single_metaworld_env(
         task_name=args.tasks[resume_from],
         image_size=conf.BasicSettings.ImageSize,
@@ -1066,18 +1170,20 @@ def main(args, remaining_opts):
     # ---- Build world model once; keep it across tasks ----------------------
     world_model = build_world_model(conf, action_dim=action_dim, proprio_dim=proprio_dim)
 
-    # Optional compile (disabled by default via env var).
     if hasattr(torch, "compile") and os.environ.get("STORM_COMPILE", "0") == "1":
         print(colorama.Fore.YELLOW + "Compiling storm_transformer..."
               + colorama.Style.RESET_ALL)
         world_model.storm_transformer = torch.compile(world_model.storm_transformer)
 
-    # Load the shared core from the last completed task (if any).
     if prev_rssm_path is not None:
         print(colorama.Fore.CYAN
               + f">>> Loading shared RSSM from {prev_rssm_path}"
               + colorama.Style.RESET_ALL)
         load_rssm_into(world_model, prev_rssm_path)
+
+    # Move PackNet masks onto cuda + register shared params (after RSSM load).
+    packnet_manager.to_device("cuda")
+    packnet_manager.register_rssm_params(world_model)
 
     # ---- Task loop ---------------------------------------------------------
     for task_idx in range(num_tasks):
@@ -1092,24 +1198,24 @@ def main(args, remaining_opts):
         print(colorama.Fore.CYAN
               + f">>> TASK {task_idx+1}/{num_tasks}: {task_name}"
               + colorama.Style.RESET_ALL)
-        print(f"    env_steps: {args.task_steps[task_idx]}")
+        print(f"    env_steps:               {args.task_steps[task_idx]}")
         print(f"    global env step (start): {global_env_step}")
+        print(f"    PackNet packed tasks:    {packnet_manager.num_tasks_packed}")
         print("=" * 64)
 
-        # For task_idx > 0 we reset the task-specific heads. For the
-        # resume case (resume_from > 0 and we're entering the first
-        # not-yet-done task), the previous task's rssm was loaded above,
-        # and we reinit fresh task heads + agent for the new task.
         if task_idx > 0 or resume_from > 0:
             print(colorama.Fore.YELLOW
                   + ">>> Reinit reward/termination heads (fresh for this task)"
                   + colorama.Style.RESET_ALL)
             reset_task_heads(world_model, conf)
+            # Re-register so any newly created shared (1D) params in the
+            # task heads are NOT in _shared_param_names (they aren't —
+            # task-head prefixes are excluded from _is_rssm_param — but
+            # cheap to recall to keep counts consistent).
+            packnet_manager.register_rssm_params(world_model)
 
-        # Fresh agent + fresh replay buffer for each task.
         agent = build_agent(conf, action_dim=action_dim)
 
-        # Optionally load task 0 from an external checkpoint.
         if task_idx == 0 and args.from_checkpoint is not None and resume_from == 0:
             ck_dir = Path(args.from_checkpoint)
             rssm_ck = ck_dir / "rssm.pt"
@@ -1131,11 +1237,7 @@ def main(args, remaining_opts):
                       + colorama.Style.RESET_ALL)
                 agent.load_state_dict(torch.load(ac_ck, map_location="cuda"))
 
-        # Per-task buffer size override (mirrors dreamer's dataset_sizes).
-        if args.task_buffer_sizes is not None:
-            buffer_max_length = int(args.task_buffer_sizes[task_idx])
-        else:
-            buffer_max_length = int(conf.JointTrainAgent.BufferMaxLength)
+        buffer_max_length = effective_task_buffer_sizes[task_idx]
 
         replay_buffer = ReplayBuffer(
             obs_shape=(conf.BasicSettings.ImageSize,
@@ -1150,9 +1252,6 @@ def main(args, remaining_opts):
         )
 
         # ---- Within-task resume ----
-        # If this task was started but not finished (e.g. process killed
-        # mid-run), restore iter counters + reload on-disk episodes so the
-        # buffer is non-empty from iter 0 of this invocation.
         save_episodes = bool(getattr(
             conf.BasicSettings, "SaveEpisodesToDisk", True,
         ))
@@ -1166,17 +1265,12 @@ def main(args, remaining_opts):
                 start_iter = int(mf.get("iter", 0))
                 episodes_done_init = int(mf.get("episodes_done", 0))
                 saved_env_step = int(mf.get("env_step", global_env_step))
-                # Use the checkpoint's env_step as the offset so wandb keys
-                # stay monotonic after a mid-task resume.
                 global_env_step = saved_env_step
                 print(colorama.Fore.CYAN
                       + f">>> Within-task resume: T{task_idx+1} @iter={start_iter}, "
                         f"global_env_step={global_env_step}, "
                         f"episodes_done={episodes_done_init}"
                       + colorama.Style.RESET_ALL)
-                # Load per-task checkpoints (rssm already loaded from the
-                # previous task; we OVERWRITE it with this task's own
-                # partial rssm + task-heads + agent).
                 rssm_ck = task_dir / "rssm.pt"
                 heads_ck = task_dir / "task_heads.pt"
                 ac_ck = task_dir / "actor_critic.pt"
@@ -1194,7 +1288,6 @@ def main(args, remaining_opts):
                 start_iter = 0
                 episodes_done_init = 0
 
-        # Reload on-disk episodes into the fresh buffer (bounded by its cap).
         if save_episodes and episode_dir.exists():
             stats = replay_buffer.load_from_directory(str(episode_dir))
             if stats["episodes_restored"] > 0:
@@ -1211,44 +1304,15 @@ def main(args, remaining_opts):
                     print(f">>> Pruned {removed} stale episode files "
                           f"(no longer in the bounded ring buffer)")
 
-        # ---- Prefill (uniform-random) ----
-        # Mirrors dreamer's per-task prefill: collect a chunk of random
-        # transitions BEFORE any world-model / agent updates so the reward
-        # decoder doesn't overfit to a tiny initial buffer at the task
-        # boundary. Skipped when the on-disk reload already filled the
-        # buffer past the threshold (within-task resume).
-        prefill_needed = max(0, PREFILL_ENV_STEPS - len(replay_buffer))
-        if prefill_needed > 0:
-            prefill_env = mw_env.build_metaworld_vec_env(
-                task_name=task_name,
-                image_size=conf.BasicSettings.ImageSize,
-                num_envs=conf.JointTrainAgent.NumEnvs,
-                seed=int(conf.BasicSettings.Seed) + task_idx * 10007 + 7,
-                camera_names=tuple(conf.Env.CameraNames),
-                time_limit=conf.Env.TimeLimit,
-                reward_range=(conf.Env.RewardMin, conf.Env.RewardMax),
-            )
-            try:
-                actual_prefill = prefill_replay_buffer(
-                    replay_buffer=replay_buffer,
-                    vec_env=prefill_env,
-                    prefill_steps=prefill_needed,
-                    save_episodes=save_episodes,
-                    episode_dir=str(episode_dir) if save_episodes else None,
-                    num_envs=conf.JointTrainAgent.NumEnvs,
-                    use_proprio=replay_buffer.use_proprio,
-                )
-            finally:
-                try:
-                    prefill_env.close()
-                except Exception:
-                    pass
-            global_env_step += actual_prefill
-
         save_sequential_progress(
             base_logdir, task_idx,
             task_name=task_name,
             global_env_step_at_start=global_env_step,
+        )
+
+        retrain_env_steps = (
+            int(args.task_steps[task_idx] * args.packnet_retrain_ratio)
+            if task_idx < num_tasks - 1 else 0
         )
 
         final_gstep = train_one_task(
@@ -1259,6 +1323,8 @@ def main(args, remaining_opts):
             world_model=world_model,
             agent=agent,
             replay_buffer=replay_buffer,
+            packnet_manager=packnet_manager,
+            retrain_env_steps=retrain_env_steps,
             logger=logger,
             base_logdir=base_logdir,
             global_env_step_offset=global_env_step,
@@ -1280,7 +1346,6 @@ def main(args, remaining_opts):
             global_env_step_at_end=global_env_step,
         )
 
-        # Cleanup task-scoped memory.
         del replay_buffer, agent
         gc.collect()
         if torch.cuda.is_available():
@@ -1316,13 +1381,11 @@ if __name__ == "__main__":
     torch.backends.cudnn.allow_tf32 = True
 
     p = argparse.ArgumentParser(
-        description="Sequential STORM training with cross-task evaluation",
+        description="Sequential STORM training with PackNet "
+                    "(conservative: weight-only pruning, frozen biases/norm)",
     )
-    p.add_argument("--tasks", nargs="+", required=True,
-                   help="Task names, e.g. metaworld_drawer-open-v3 ...")
-    p.add_argument("--task-steps", nargs="+", type=int, required=True,
-                   help="Env-step budget per task (one per task).")
-
+    p.add_argument("--tasks", nargs="+", required=True)
+    p.add_argument("--task-steps", nargs="+", type=int, required=True)
     p.add_argument("--logdir", type=str, required=True)
     p.add_argument("--config_path", type=str,
                    default="config_files/STORM_metaworld.yaml")
@@ -1330,15 +1393,12 @@ if __name__ == "__main__":
 
     p.add_argument("--wandb-entity", type=str, default="haoyu-a2i")
     p.add_argument("--wandb-project", type=str,
-                   default="Metaworld_STORM_Sequential")
+                   default="Metaworld_STORM_Sequential_PackNet")
     p.add_argument("--wandb-run-name", type=str, default=None)
-    p.add_argument("--wandb-run-id", type=str, default=None,
-                   help="Existing wandb run id to resume with resume='allow'.")
+    p.add_argument("--wandb-run-id", type=str, default=None)
     p.add_argument("--no-wandb", action="store_true")
 
-    p.add_argument("--from-checkpoint", type=str, default=None,
-                   help="Dir with rssm.pt/task_heads.pt/actor_critic.pt "
-                        "for task 0 only.")
+    p.add_argument("--from-checkpoint", type=str, default=None)
     p.add_argument("--skip-pretrain", action="store_true",
                    help="(reserved; STORM has no explicit pretrain phase)")
 
@@ -1348,8 +1408,21 @@ if __name__ == "__main__":
     p.add_argument(
         "--task-buffer-sizes", nargs="+", type=int, default=None,
         help="Optional per-task BufferMaxLength override (one value per "
-             "task). Falls back to conf.JointTrainAgent.BufferMaxLength "
-             "when omitted. Mirrors dreamer's --dataset-sizes.",
+             "task). Falls back to conf.JointTrainAgent.BufferMaxLength.",
+    )
+
+    # PackNet hyperparameters
+    p.add_argument(
+        "--packnet-prune-ratio", type=float, default=0.75,
+        help="Fraction of free weights to prune after each task "
+             "(default: 0.75). Higher = more aggressive pruning, more "
+             "room for future tasks.",
+    )
+    p.add_argument(
+        "--packnet-retrain-ratio", type=float, default=0.1,
+        help="Fraction of each task's training env-steps used for the "
+             "retrain phase after pruning (default: 0.1 = 10%%). Set to "
+             "0 to skip retrain.",
     )
 
     main_args, remaining = p.parse_known_args()

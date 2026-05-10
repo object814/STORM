@@ -838,6 +838,47 @@ def train_one_task(
                         logger=logger,
                         sample_proprio=s_prop,
                     )
+                    # Imagined-reward diagnostics. Story A (action-blind reward
+                    # decoder) predicts |actor_mean - random_mean| ≈ 0; Story B
+                    # (decoder learned a misleading action-conditional signal
+                    # the actor exploits) predicts a meaningful positive gap.
+                    if total_steps % 50 == 0:
+                        logger.log("WorldModel/imag_reward_mean",
+                                   float(rew_hat.float().mean().item()))
+                        logger.log("WorldModel/imag_reward_std",
+                                   float(rew_hat.float().std().item()))
+
+                        class _UniformAgent:
+                            def __init__(self, action_dim, continuous):
+                                self.action_dim = action_dim
+                                self.continuous = continuous
+                            def sample(self, latent, greedy=False):
+                                # latent: (B, 1, F). Output (B, 1, A) tanh-Gaussian-style range.
+                                B = latent.shape[0]
+                                if self.continuous:
+                                    return (torch.rand(
+                                        B, 1, self.action_dim, device=latent.device
+                                    ) * 2.0 - 1.0).to(latent.dtype)
+                                return torch.randint(
+                                    0, self.action_dim, (B, 1), device=latent.device
+                                )
+                            def eval(self): return None
+                            def train(self): return None
+                        rand_agent = _UniformAgent(
+                            agent.action_dim, agent.continuous_action,
+                        )
+                        _, _, rew_hat_rand, _ = world_model.imagine_data(
+                            rand_agent, s_obs, s_act,
+                            imagine_batch_size=imagine_batch_size + imagine_demo_batch_size,
+                            imagine_batch_length=imagine_batch_length,
+                            log_video=False, logger=logger,
+                            sample_proprio=s_prop,
+                        )
+                        logger.log("WorldModel/imag_reward_mean_random",
+                                   float(rew_hat_rand.float().mean().item()))
+                        logger.log("WorldModel/imag_reward_actor_minus_random",
+                                   float(rew_hat.float().mean().item()
+                                         - rew_hat_rand.float().mean().item()))
                 agent.update(
                     latent=latent, action=ac_action,
                     old_logprob=None, old_value=None,

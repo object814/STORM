@@ -4,6 +4,7 @@ BasicSettings:
   Seed: 0
   ImageSize: 64
   ReplayBufferOnGPU: True
+  SaveEpisodesToDisk: True
 
 Env:
   Suite: "metaworld"
@@ -49,4 +50,4 @@ Models:
     HiddenDim: 512
     Gamma: 0.985
     Lambda: 0.95
-    EntropyCoef: 3E-4
+    EntropyCoef: 1E-3 # TEMP! Changed from 3E-4 to 1E-3
