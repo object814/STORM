@@ -89,7 +89,10 @@ class MultiHeadAttention(nn.Module):
         # Combine the last two dimensions to concatenate all the heads together: b x lq x (n*dv)
         q = q.transpose(1, 2).contiguous().view(sz_b, len_q, -1)
         q = self.dropout(self.fc(q))
-        q += residual
+        # Out-of-place add so the pathwise actor update can backprop through
+        # T imagination steps without later steps clobbering tensors saved
+        # for earlier steps' backward (autograd version-counter mismatch).
+        q = q + residual
 
         q = self.layer_norm(q)
 
@@ -112,7 +115,8 @@ class PositionwiseFeedForward(nn.Module):
 
         x = self.w_2(F.relu(self.w_1(x)))
         x = self.dropout(x)
-        x += residual
+        # Out-of-place add — see same note in MultiHeadAttention above.
+        x = x + residual
 
         x = self.layer_norm(x)
 

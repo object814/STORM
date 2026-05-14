@@ -174,13 +174,21 @@ def train_world_model_step(replay_buffer, world_model, batch_size, demo_batch_si
         world_model.update(obs, action, reward, termination, logger=logger)
 
 
-@torch.no_grad()
-def world_model_imagine_data(replay_buffer, world_model, agent,
-                             imagine_batch_size, imagine_demo_batch_size,
-                             imagine_context_length, imagine_batch_length,
-                             log_video, logger):
+def world_model_imagine_data_grad(replay_buffer, world_model, agent,
+                                  imagine_batch_size, imagine_demo_batch_size,
+                                  imagine_context_length, imagine_batch_length):
+    """Pathwise (dreamer-style) imagination — gradients PRESERVED.
+
+    Used together with ActorCriticAgent.update_pathwise: imagined reward
+    / termination are differentiable in actor params via the rollout's
+    reparameterized actions, so the actor loss is `-mean(lambda_return)`
+    rather than REINFORCE's `-(log_prob × advantage)`. See the same
+    block in train_metaworld_sequential.py for the continual-learning
+    motivation; for single-task training this gives lower-variance
+    actor gradients (Heess et al. 2015 / DreamerV3).
+    """
     world_model.eval()
-    agent.eval()
+    agent.train()
     sample = replay_buffer.sample(imagine_batch_size, imagine_demo_batch_size, imagine_context_length)
     if replay_buffer.use_proprio:
         sample_obs, sample_action, sample_reward, sample_termination, sample_proprio = sample
@@ -188,15 +196,13 @@ def world_model_imagine_data(replay_buffer, world_model, agent,
         sample_obs, sample_action, sample_reward, sample_termination = sample
         sample_proprio = None
 
-    latent, action, reward_hat, termination_hat = world_model.imagine_data(
+    latent, action, reward_hat, termination_hat = world_model.imagine_data_grad(
         agent, sample_obs, sample_action,
         imagine_batch_size=imagine_batch_size + imagine_demo_batch_size,
         imagine_batch_length=imagine_batch_length,
-        log_video=log_video,
-        logger=logger,
         sample_proprio=sample_proprio,
     )
-    return latent, action, None, None, reward_hat, termination_hat
+    return latent, action, reward_hat, termination_hat
 
 
 # ---------------------------------------------------------------------------
@@ -379,29 +385,33 @@ def joint_train_world_model_agent(
                 logger=logger,
             )
 
-        # -------- agent update --------
+        # -------- agent update (pathwise / dreamer-style) --------
+        # Imagine WITH gradients so actor params receive a pathwise
+        # gradient through reward / termination. Replaces the REINFORCE
+        # path (agent.update on detached imagination) for consistency
+        # with train_metaworld_sequential.py and to give the actor a
+        # lower-variance, self-regulating training signal.
         if replay_buffer.ready() and total_steps % (max(train_agent_every // num_envs, 1)) == 0:
-            log_video = (total_steps % (max(save_every // num_envs, 1)) == 0)
-            imagine_latent, agent_action, agent_logprob, agent_value, imagine_reward, imagine_termination = world_model_imagine_data(
-                replay_buffer=replay_buffer,
-                world_model=world_model,
-                agent=agent,
-                imagine_batch_size=imagine_batch_size,
-                imagine_demo_batch_size=imagine_demo_batch_size,
-                imagine_context_length=imagine_context_length,
-                imagine_batch_length=imagine_batch_length,
-                log_video=log_video,
-                logger=logger,
-            )
-            agent.update(
-                latent=imagine_latent,
-                action=agent_action,
-                old_logprob=agent_logprob,
-                old_value=agent_value,
-                reward=imagine_reward,
-                termination=imagine_termination,
-                logger=logger,
-            )
+            world_model.requires_grad_(False)
+            try:
+                imagine_latent, agent_action, imagine_reward, imagine_termination = world_model_imagine_data_grad(
+                    replay_buffer=replay_buffer,
+                    world_model=world_model,
+                    agent=agent,
+                    imagine_batch_size=imagine_batch_size,
+                    imagine_demo_batch_size=imagine_demo_batch_size,
+                    imagine_context_length=imagine_context_length,
+                    imagine_batch_length=imagine_batch_length,
+                )
+                agent.update_pathwise(
+                    latent=imagine_latent,
+                    action=agent_action,
+                    reward=imagine_reward,
+                    termination=imagine_termination,
+                    logger=logger,
+                )
+            finally:
+                world_model.requires_grad_(True)
 
         # -------- checkpointing --------
         if total_steps % (max(save_every // num_envs, 1)) == 0:

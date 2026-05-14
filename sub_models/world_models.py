@@ -151,13 +151,17 @@ class DistHead(nn.Module):
 class RewardDecoder(nn.Module):
     def __init__(self, num_classes, embedding_size, transformer_hidden_dim) -> None:
         super().__init__()
+        # inplace=False — the backbone is called T times inside the pathwise
+        # imagination graph (imagine_data_grad); in-place ReLU at step i+1
+        # would clobber a tensor saved for step i's backward. See the same
+        # note in StochasticTransformerKVCache.stem.
         self.backbone = nn.Sequential(
             nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
             nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
             nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
         )
         self.head = nn.Linear(transformer_hidden_dim, num_classes)
 
@@ -170,13 +174,14 @@ class RewardDecoder(nn.Module):
 class TerminationDecoder(nn.Module):
     def __init__(self,  embedding_size, transformer_hidden_dim) -> None:
         super().__init__()
+        # inplace=False — see RewardDecoder note.
         self.backbone = nn.Sequential(
             nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
             nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(transformer_hidden_dim, transformer_hidden_dim, bias=False),
             nn.LayerNorm(transformer_hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
         )
         self.head = nn.Sequential(
             nn.Linear(transformer_hidden_dim, 1),
@@ -464,6 +469,113 @@ class WorldModel(nn.Module):
             logger.log("Imagine/predict_video", torch.clamp(torch.cat(obs_hat_list, dim=1), 0, 1).cpu().float().detach().numpy())
 
         return torch.cat([self.latent_buffer, self.hidden_buffer], dim=-1), self.action_buffer, self.reward_hat_buffer, self.termination_hat_buffer
+
+    def predict_next_grad(self, last_flattened_sample, action):
+        """Differentiable variant of predict_next, used by imagine_data_grad.
+
+        Two differences from predict_next:
+          * termination is returned as a smooth sigmoid probability rather
+            than a hard ``> 0`` boolean. This is required so the lambda
+            return is differentiable.
+          * obs_hat is never decoded (image_decoder isn't called in
+            imagination; saves compute).
+        Reward is decoded via SymLogTwoHotLoss.decode, which IS already
+        smooth in dist_feat, so it carries gradient like dreamer's
+        symexp-twohot reward head.
+        """
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=self.use_amp):
+            dist_feat = self.storm_transformer.forward_with_kv_cache(
+                last_flattened_sample, action,
+            )
+            prior_logits = self.dist_head.forward_prior(dist_feat)
+            prior_sample = self.stright_throught_gradient(
+                prior_logits, sample_mode="random_sample",
+            )
+            prior_flattened_sample = self.flatten_sample(prior_sample)
+            reward_logits = self.reward_decoder(dist_feat)
+            reward_hat = self.symlog_twohot_loss_func.decode(reward_logits)
+            term_logits = self.termination_decoder(dist_feat)
+            term_prob = torch.sigmoid(term_logits)
+        return reward_hat, term_prob, prior_flattened_sample, dist_feat
+
+    def imagine_data_grad(self, agent, sample_obs, sample_action,
+                          imagine_batch_size, imagine_batch_length,
+                          sample_proprio=None):
+        """Pathwise-differentiable variant of imagine_data.
+
+        Mirrors dreamer's _imagine (models.py): builds an imagined rollout
+        where every operation is differentiable in the actor's parameters.
+        Used by ActorCriticAgent.update_pathwise to backprop the lambda
+        return all the way to the actor's weights, instead of REINFORCE's
+        score-function estimator on detached imagination.
+
+        Key differences from imagine_data:
+          * No in-place buffer writes (those break autograd). The rollout
+            is built as Python lists of per-step tensors, then concatenated.
+          * Calls agent.sample_grad(feat.detach()), which uses Normal.rsample
+            so the action carries gradient to actor params. The feat is
+            detached on the way INTO the policy (matching dreamer:
+            ``inp = feat.detach()``) so the actor only receives gradient
+            from its action's downstream effect on future reward, not from
+            how it conditions on the current state — keeping the actor's
+            gradient separate from the world-model's representation gradient.
+          * Termination is a smooth sigmoid probability (see predict_next_grad).
+
+        Returns (feat, action, reward, term_prob) of shapes:
+            feat:       (B, T+1, latent_dim + transformer_hidden_dim)
+            action:     (B, T, action_dim)
+            reward:     (B, T)
+            term_prob:  (B, T)
+        """
+        # Reset KV cache. dtype must match what gets cached during the rollout
+        # since the cache concatenates into a single tensor across steps.
+        self.storm_transformer.reset_kv_cache_list(
+            imagine_batch_size, dtype=self.tensor_dtype,
+        )
+
+        # Burn in the context using real observations. We only need the
+        # final latent + dist_feat to seed imagination; intermediate values
+        # are part of the world model's own forward, not the actor's graph.
+        context_latent = self.encode_obs(sample_obs, sample_proprio)
+        last_latent = None
+        last_dist_feat = None
+        for i in range(sample_obs.shape[1]):
+            _, _, _, last_latent, last_dist_feat = self.predict_next(
+                context_latent[:, i:i+1],
+                sample_action[:, i:i+1],
+                log_video=False,
+            )
+
+        latents = [last_latent]
+        dist_feats = [last_dist_feat]
+        actions = []
+        rewards = []
+        terms = []
+
+        for _ in range(imagine_batch_length):
+            cur_feat = torch.cat([latents[-1], dist_feats[-1]], dim=-1)
+            # Detach the feat on the way INTO the policy (dreamer convention).
+            # Gradient still flows from this step's ACTION through the world
+            # model into next step's feat / reward — that's the path we want
+            # to optimize.
+            action = agent.sample_grad(cur_feat.detach())
+            reward_hat, term_prob, next_latent, next_dist_feat = \
+                self.predict_next_grad(latents[-1], action)
+
+            actions.append(action)
+            rewards.append(reward_hat)
+            terms.append(term_prob)
+            latents.append(next_latent)
+            dist_feats.append(next_dist_feat)
+
+        feat = torch.cat(
+            [torch.cat(latents, dim=1), torch.cat(dist_feats, dim=1)],
+            dim=-1,
+        )
+        action_seq = torch.cat(actions, dim=1)
+        reward_seq = torch.cat(rewards, dim=1)
+        term_seq = torch.cat(terms, dim=1)
+        return feat, action_seq, reward_seq, term_seq
 
     def update(self, obs, action, reward, termination, logger=None, proprio=None):
         self.train()

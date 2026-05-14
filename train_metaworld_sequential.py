@@ -808,11 +808,17 @@ def train_one_task(
                     s_obs, s_act, s_rew, s_term = sample
                     world_model.update(s_obs, s_act, s_rew, s_term, logger=logger)
 
-            # --------- agent update (on imagined rollouts) ---------
+            # --------- agent update (on imagined rollouts, pathwise) ---------
+            # Dreamer-style pathwise (dynamics) gradient: imagine WITH grads
+            # so the actor's loss flows through reward / termination back to
+            # actor params via reparameterized actions. Replaces the original
+            # REINFORCE update which detached imagination — that variant
+            # cannot self-regulate when the reward decoder is action-blind
+            # at task boundaries, and drifts the actor to corner-saturated
+            # bang-bang policies. See agents.ActorCriticAgent.update_pathwise.
             if replay_buffer.ready() and (
                 total_steps % max(train_agent_every // num_envs, 1) == 0
             ):
-                log_video = (total_steps % save_every_iters == 0)
                 sample = replay_buffer.sample(
                     imagine_batch_size, imagine_demo_batch_size, imagine_context_length
                 )
@@ -821,29 +827,28 @@ def train_one_task(
                 else:
                     s_obs, s_act, s_rew, s_term = sample
                     s_prop = None
-                # imagine under no_grad so the rollout does not keep a
-                # graph through the world-model parameters — matches
-                # train_metaworld.world_model_imagine_data's @torch.no_grad
-                # decorator. Without this, agent.update() will try to
-                # backward through a graph the world-model's own backward
-                # has already freed.
-                with torch.no_grad():
-                    world_model.eval()
-                    agent.eval()
-                    latent, ac_action, rew_hat, term_hat = world_model.imagine_data(
+                # Freeze world model so the actor's backward through imagined
+                # reward / termination doesn't accumulate gradients on the
+                # world-model params (the agent's Adam doesn't own them, but
+                # leftover grads would corrupt the WM's next backward, which
+                # uses += semantics on .grad). Restored in `finally`.
+                world_model.eval()
+                agent.train()
+                world_model.requires_grad_(False)
+                try:
+                    latent, ac_action, rew_hat, term_hat = world_model.imagine_data_grad(
                         agent, s_obs, s_act,
                         imagine_batch_size=imagine_batch_size + imagine_demo_batch_size,
                         imagine_batch_length=imagine_batch_length,
-                        log_video=log_video,
-                        logger=logger,
                         sample_proprio=s_prop,
                     )
-                agent.update(
-                    latent=latent, action=ac_action,
-                    old_logprob=None, old_value=None,
-                    reward=rew_hat, termination=term_hat,
-                    logger=logger,
-                )
+                    agent.update_pathwise(
+                        latent=latent, action=ac_action,
+                        reward=rew_hat, termination=term_hat,
+                        logger=logger,
+                    )
+                finally:
+                    world_model.requires_grad_(True)
 
             # --------- cross-task evaluation ---------
             if total_steps > 0 and total_steps % eval_every_iters == 0:

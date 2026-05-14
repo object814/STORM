@@ -53,10 +53,17 @@ class StochasticTransformerKVCache(nn.Module):
         self.continuous_action = continuous_action
 
         # mix image_embedding and action
+        # NOTE: inplace=False is required for the pathwise (dynamics) actor
+        # update. The stem is called T times inside imagine_data_grad's
+        # autograd graph; in-place ReLU at step i+1 would clobber a tensor
+        # saved for step i's backward, producing a "modified by an inplace
+        # operation" version-check error in autograd. The in-place variant
+        # was safe under the REINFORCE path because imagination ran under
+        # torch.no_grad and nothing was saved for backward.
         self.stem = nn.Sequential(
             nn.Linear(stoch_dim+action_dim, feat_dim, bias=False),
             nn.LayerNorm(feat_dim),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(feat_dim, feat_dim, bias=False),
             nn.LayerNorm(feat_dim)
         )
